@@ -1,0 +1,63 @@
+[project]
+name = "voxelvr"
+version = "0.1.0"
+description = "Multi-camera full body tracking for VRChat"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [
+    {name = "VoxelVR Contributors"}
+]
+
+dependencies = [
+    "numpy>=1.24",
+    "opencv-python>=4.8",
+    "pyyaml>=6.0",
+    "pydantic>=2.0",
+    "pydantic-settings>=2.0",
+    "python-osc>=1.8",
+    "scipy>=1.11",
+]
+
+[project.optional-dependencies]
+gpu = [
+    "onnxruntime-directml>=1.16; sys_platform == 'win32'",
+    "onnxruntime-gpu>=1.16; sys_platform == 'linux'",
+]
+viz = [
+    "pyvista>=0.42",
+    "open3d>=0.17",
+]
+gui = [
+    "dearpygui>=1.10",
+]
+dev = [
+    "pytest>=7.0",
+    "black",
+    "ruff",
+]
+all = [
+    "voxelvr[gpu,viz,gui,dev]",
+]
+
+[project.scripts]
+voxelvr-calibrate = "voxelvr.cli:run_calibration"
+voxelvr-demo = "voxelvr.cli:run_demo"
+voxelvr-track = "voxelvr.cli:run_tracking"
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["voxelvr*"]
+
+[tool.black]
+line-length = 100
+target-version = ['py310']
+
+[tool.ruff]
+line-length = 100
+select = ["E", "F", "I", "N"]
+ignore = ["E501"]
