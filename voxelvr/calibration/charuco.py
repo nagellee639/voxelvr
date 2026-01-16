@@ -95,28 +95,26 @@ def detect_charuco(
     # Convert to grayscale
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
     
-    # Detect ArUco markers
+    
+    # Use CharucoDetector (OpenCV 4.7+)
+    # Note: interpolateCornersCharuco is deprecated/moved in newer versions
+    
+    detector = cv2.aruco.CharucoDetector(board)
+    
+    # Set detector parameters if needed
     detector_params = cv2.aruco.DetectorParameters()
-    detector = cv2.aruco.ArucoDetector(aruco_dict, detector_params)
-    marker_corners, marker_ids, rejected = detector.detectMarkers(gray)
+    detector.setDetectorParameters(detector_params)
     
-    if marker_ids is None or len(marker_ids) < 4:
-        return result
+    # Detect
+    # detectBoard returns (charucoCorners, charucoIds, markerCorners, markerIds)
+    charuco_corners, charuco_ids, marker_corners, marker_ids = detector.detectBoard(gray)
     
-    result['marker_corners'] = marker_corners
-    result['marker_ids'] = marker_ids
+    if marker_ids is not None:
+        result['marker_corners'] = marker_corners
+        result['marker_ids'] = marker_ids
+        cv2.aruco.drawDetectedMarkers(result['image_with_markers'], marker_corners, marker_ids)
     
-    # Draw detected markers
-    cv2.aruco.drawDetectedMarkers(result['image_with_markers'], marker_corners, marker_ids)
-    
-    # Interpolate ChArUco corners
-    num_corners, charuco_corners, charuco_ids = cv2.aruco.interpolateCornersCharuco(
-        marker_corners, marker_ids, gray, board,
-        cameraMatrix=camera_matrix,
-        distCoeffs=distortion_coeffs
-    )
-    
-    if num_corners < 4:
+    if charuco_corners is None or len(charuco_corners) < 4:
         return result
     
     result['success'] = True

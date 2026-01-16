@@ -47,6 +47,7 @@ class CalibrationState:
     all_cameras_visible: bool = False
     error_message: str = ""
     is_running: bool = False
+    auto_capture: bool = True  # Default to true for convenience
 
 
 class CalibrationPanel:
@@ -106,6 +107,12 @@ class CalibrationPanel:
         # Board detection results
         self._board = None
         self._aruco_dict = None
+        
+        # Auto-capture state
+        self._last_capture_time: Dict[int, float] = {}
+        self._last_capture_corners: Dict[int, np.ndarray] = {}
+        self._capture_cooldown = 1.0  # Seconds
+        self._movement_threshold = 50.0  # Pixel distance sum
     
     @property
     def state(self) -> CalibrationState:
@@ -285,6 +292,62 @@ class CalibrationPanel:
         
         self._notify_step_change()
     
+        self._notify_step_change()
+    
+    def toggle_auto_capture(self) -> None:
+        """Toggle auto-capture mode."""
+        self._state.auto_capture = not self._state.auto_capture
+        self._notify_progress()
+    
+    def should_auto_capture(self, camera_id: int, corners: np.ndarray, require_all_cameras: bool = False) -> bool:
+        """
+        Check if a frame should be auto-captured.
+        
+        Args:
+            camera_id: ID of camera provided
+            corners: Detected corners
+            require_all_cameras: If True, checks if ALL cameras see the board now
+        """
+        if not self._state.auto_capture:
+            return False
+            
+        now = time.time()
+        
+        # If requiring all cameras, we check global state
+        if require_all_cameras and not self._state.all_cameras_visible:
+            return False
+            
+        # Check global cooldown if requiring all cameras (batch capture)
+        # Otherwise check per-camera cooldown
+        last_time = self._last_capture_time.get(camera_id, 0)
+        if now - last_time < self._capture_cooldown:
+            return False
+            
+        # Check movement
+        # If this camera recorded a previous capture, check if we moved enough
+        if camera_id in self._last_capture_corners:
+            last_corners = self._last_capture_corners[camera_id]
+            
+            # Simple check: if number of corners differs significantly, it's a new pose
+            if len(corners) != len(last_corners):
+                return True
+                
+            # Check displacement (average movement of corners)
+            # Only compare matching shape
+            try:
+                # Euclidean distance
+                dist = np.linalg.norm(corners - last_corners, axis=2)
+                mean_dist = np.mean(dist)
+                
+                if mean_dist < self._movement_threshold:
+                     return False
+                     
+            except Exception:
+                # Shape mismatch or other error
+                return True
+
+        return True
+    
     def export_board_pdf(self, output_path: Path) -> bool:
         """
         Export the ChArUco board as a PDF.
@@ -379,6 +442,11 @@ class CalibrationPanel:
         })
         
         self._state.cameras[camera_id].intrinsic_frames = len(self._intrinsic_frames[camera_id])
+        
+        # Update auto-capture state
+        self._last_capture_time[camera_id] = time.time()
+        self._last_capture_corners[camera_id] = corners.copy()
+        
         self._notify_progress()
         
         return True
@@ -401,9 +469,9 @@ class CalibrationPanel:
         if self._state.current_step != CalibrationStep.EXTRINSIC_CAPTURE:
             return False
         
-        # Only capture if all cameras see the board
-        if not self._state.all_cameras_visible:
-            return False
+        # Relaxed check: app.py handles the "at least one" logic now
+        # if not self._state.all_cameras_visible:
+        #     return False
         
         self._extrinsic_captures.append({
             'frames': {k: v.copy() for k, v in frames.items()},

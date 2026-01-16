@@ -19,7 +19,7 @@ import os
 
 # Model URLs for download
 MOVENET_URL = "https://storage.googleapis.com/tfhub-modules/google/movenet/singlepose/lightning/4.tar.gz"
-MOVENET_ONNX_URL = "https://github.com/PINTO0309/PINTO_model_zoo/raw/main/115_MoveNet/resources/movenet_singlepose_lightning_4.onnx"
+MOVENET_ONNX_URL = "https://huggingface.co/Xenova/movenet-singlepose-lightning/resolve/main/onnx/model.onnx"
 
 
 @dataclass
@@ -152,6 +152,7 @@ class PoseDetector2D:
             input_info = self.session.get_inputs()[0]
             self.input_name = input_info.name
             self.input_shape = input_info.shape
+            self.input_type = input_info.type  # e.g. 'tensor(int32)' or 'tensor(float)'
             
             # Handle dynamic dimensions
             if len(self.input_shape) >= 4:
@@ -160,7 +161,7 @@ class PoseDetector2D:
                 self.input_height = h
                 self.input_width = w
             
-            print(f"Model loaded: input shape = {self.input_shape}")
+            print(f"Model loaded: input shape={self.input_shape}, type={self.input_type}")
             return True
             
         except Exception as e:
@@ -262,8 +263,13 @@ class PoseDetector2D:
         # Convert BGR to RGB
         rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
         
-        # Normalize to [0, 1] or [-1, 1] depending on model
-        # MoveNet expects int8 input in range [0, 255] or float32 [0, 1]
+        # Check expected input type
+        if hasattr(self, 'input_type') and 'int32' in self.input_type:
+             # MoveNet specific: [1, 192, 192, 3] int32 tensor with values [0, 255]
+             tensor = np.expand_dims(rgb, axis=0).astype(np.int32)
+             return tensor
+        
+        # Default: float32 normalized [0, 1]
         normalized = rgb.astype(np.float32) / 255.0
         
         # Add batch dimension and ensure NHWC format (for MoveNet)

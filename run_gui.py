@@ -132,17 +132,22 @@ def run_tracking_thread(app: VoxelVRApp, config: VoxelVRConfig, calibration: Mul
             frames = {cam_id: f.image for cam_id, f in frames_raw.items()}
             capture_time = time.time() - loop_start
             
-            # Update camera previews in GUI
-            for cam_id, frame in frames.items():
-                app.update_camera_frame(cam_id, frame)
-            
-            # 2D pose detection
+            # 2D pose detection and GUI Update
             detect_start = time.time()
             keypoints_2d = {}
+            
             for cam_id, frame in frames.items():
                 kp = detector.detect(frame, camera_id=cam_id)
+                frame_to_show = frame.copy()
+                
                 if kp:
                     keypoints_2d[cam_id] = kp
+                    # Visualize detections
+                    frame_to_show = detector.draw_keypoints(frame_to_show, kp)
+                
+                # Update GUI with annotated frame
+                app.update_camera_frame(cam_id, frame_to_show)
+                
             detect_time = time.time() - detect_start
             
             # 3D triangulation

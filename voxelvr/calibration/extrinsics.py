@@ -31,6 +31,7 @@ def create_transform_matrix(R: np.ndarray, t: np.ndarray) -> np.ndarray:
     return T
 
 
+
 def invert_transform(T: np.ndarray) -> np.ndarray:
     """Invert a 4x4 transformation matrix."""
     R = T[:3, :3]
@@ -39,6 +40,16 @@ def invert_transform(T: np.ndarray) -> np.ndarray:
     T_inv[:3, :3] = R.T
     T_inv[:3, 3] = -R.T @ t
     return T_inv
+
+
+def _detect_worker(frame: np.ndarray, board_params: tuple, dict_name: str, cam_matrix: Optional[np.ndarray], dist_coeffs: Optional[np.ndarray]) -> dict:
+    """Worker function for parallel ChArUco detection."""
+    # Re-create board locally to ensure pickle compatibility/safety
+    squares_x, squares_y, square_len, marker_len = board_params
+    board, aruco_dict = create_charuco_board(
+        squares_x, squares_y, square_len, marker_len, dict_name
+    )
+    return detect_charuco(frame, board, aruco_dict, cam_matrix, dist_coeffs)
 
 
 def capture_extrinsic_frames(
@@ -227,23 +238,80 @@ def calibrate_extrinsics(
     # Collect all board poses per camera
     camera_poses = {cam_id: [] for cam_id in intrinsics_map.keys()}
     
-    for capture in captures:
-        for cam_id, frame in capture.items():
-            intr = intrinsics_map.get(cam_id)
-            if intr is None:
-                continue
+    # Try using optimized C++ implementation
+    try:
+        from .calibration_cpp import batch_detect_charuco
+        print("Using optimized C++ calibration backend")
+        
+        # Prepare batch for C++
+        # We need flat list of images and method to map back
+        # captures is List[Dict[cam_id, frame]]
+        
+        # Flatten: (capture_idx, cam_id, frame, intr)
+        flat_items = []
+        for i, capture in enumerate(captures):
+            for cam_id, frame in capture.items():
+                if cam_id in intrinsics_map:
+                    flat_items.append((cam_id, frame))
+        
+        if flat_items:
+            images = [item[1] for item in flat_items]
             
-            cam_matrix = get_camera_matrix(intr)
-            dist_coeffs = get_distortion_coeffs(intr)
+            # Run batch detection
+            results = batch_detect_charuco(
+                images,
+                config.charuco_squares_x,
+                config.charuco_squares_y,
+                config.charuco_square_length,
+                config.charuco_marker_length,
+                config.charuco_dict
+            )
             
-            result = detect_charuco(frame, board, aruco_dict, cam_matrix, dist_coeffs)
-            
-            if result['success']:
-                success, rvec, tvec = estimate_pose(
-                    result['corners'], result['ids'], board, cam_matrix, dist_coeffs
-                )
-                if success:
-                    camera_poses[cam_id].append((rvec, tvec))
+            # Process results
+            for i, result in enumerate(results):
+                if result['success']:
+                    cam_id = flat_items[i][0]
+                    intr = intrinsics_map[cam_id]
+                    cam_matrix = get_camera_matrix(intr)
+                    dist_coeffs = get_distortion_coeffs(intr)
+                    
+                    # Convert corners to float32 if not already
+                    corners = result['corners']
+                    ids = result['ids']
+                    
+                    success, rvec, tvec = estimate_pose(
+                        corners, ids, board, cam_matrix, dist_coeffs
+                    )
+                    if success:
+                        camera_poses[cam_id].append((rvec, tvec))
+                        
+    except ImportError:
+        print("C++ extension not found, falling back to Python implementation")
+        # Python implementation (Parallel or Sequential)
+        # Previous Parallel implementation is good, but let's just stick to simple for robustness if C++ fails
+        # or reuse the parallel implementation if verified.
+        # Given I overwrote the parallel code earlier, I should probably put back a reliable python loop
+        # or leave the parallel code if I didn't overwrite it fully?
+        # I did overwrite it in step 113.
+        # I will re-implement a simple loop here as fallback to avoid complexity
+        
+        for capture in captures:
+            for cam_id, frame in capture.items():
+                intr = intrinsics_map.get(cam_id)
+                if intr is None:
+                    continue
+                
+                cam_matrix = get_camera_matrix(intr)
+                dist_coeffs = get_distortion_coeffs(intr)
+                
+                result = detect_charuco(frame, board, aruco_dict, cam_matrix, dist_coeffs)
+                
+                if result['success']:
+                    success, rvec, tvec = estimate_pose(
+                        result['corners'], result['ids'], board, cam_matrix, dist_coeffs
+                    )
+                    if success:
+                        camera_poses[cam_id].append((rvec, tvec))
     
     # Check we have enough data
     for cam_id, poses in camera_poses.items():

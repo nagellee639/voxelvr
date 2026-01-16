@@ -6,6 +6,7 @@ Main application window integrating all GUI panels.
 
 import dearpygui.dearpygui as dpg
 import numpy as np
+import cv2
 import time
 import threading
 from typing import Optional, Dict, List, Callable
@@ -241,7 +242,7 @@ class VoxelVRApp:
             # Camera grid container
             with dpg.child_window(tag="camera_grid", autosize_x=True, height=500):
                 dpg.add_text("No cameras detected. Click 'Detect Cameras'.", tag="no_cameras_text")
-    
+
     def _create_calibration_tab(self) -> None:
         """Create the calibration tab."""
         with dpg.group():
@@ -256,12 +257,19 @@ class VoxelVRApp:
             dpg.add_separator()
             
             # Instructions panel
-            with dpg.child_window(tag="calib_instructions", height=150, autosize_x=True):
+            with dpg.child_window(tag="calib_instructions", height=100, autosize_x=True):
                 dpg.add_text(
                     self.calibration_panel.get_step_instructions(),
                     tag="calib_instructions_text",
                     wrap=0,
                 )
+            
+            dpg.add_separator()
+            
+            # Camera feeds
+            dpg.add_text("Live Preview:", color=(150, 150, 150))
+            with dpg.child_window(tag="calib_camera_grid", height=300, autosize_x=True):
+                dpg.add_text("No cameras active.", tag="calib_no_cameras_text")
             
             dpg.add_separator()
             
@@ -288,6 +296,14 @@ class VoxelVRApp:
                     tag="calib_cancel_btn",
                     callback=self._on_calibration_cancel_click,
                     enabled=False,
+                )
+                
+                dpg.add_spacer(width=20)
+                dpg.add_checkbox(
+                    label="Auto-Capture",
+                    tag="calib_auto_capture",
+                    default_value=True,
+                    callback=lambda s, a: self.calibration_panel.toggle_auto_capture(),
                 )
             
             dpg.add_separator()
@@ -361,6 +377,13 @@ class VoxelVRApp:
                     dpg.add_separator()
                     
                     dpg.add_text("Tracking stopped", tag="tracking_status_text")
+                    
+                    dpg.add_spacer(height=10)
+                    
+                    # Tracking Preview
+                    dpg.add_text("Live Preview:", color=(150, 150, 150))
+                    with dpg.child_window(tag="tracking_camera_grid", height=200, autosize_x=True):
+                         dpg.add_text("No cameras active.", tag="tracking_no_cameras_text")
                     
                     dpg.add_spacer(height=10)
                     
@@ -523,10 +546,12 @@ class VoxelVRApp:
         
         from ..capture.camera import Camera
         
-        configs = [
-            CameraConfig(id=i, resolution=Camera.get_best_resolution(i), fps=30) 
-            for i in camera_ids
-        ]
+        from ..capture.camera import Camera
+        
+        configs = []
+        for i in camera_ids:
+            w, h, fps = Camera.get_best_configuration(i, target_fps=30)
+            configs.append(CameraConfig(id=i, resolution=(w, h), fps=fps))
         
         self.camera_manager = CameraManager(configs)
         if self.camera_manager.start_all():
@@ -548,7 +573,18 @@ class VoxelVRApp:
             self.camera_manager = None
 
     def _preview_loop(self) -> None:
-        """Background loop for camera preview."""
+        # Pre-create board for loop efficiency
+        from ..calibration.charuco import detect_charuco, create_charuco_board
+        
+        # We assume board params don't change during preview loop (they shouldn't)
+        board, aruco_dict = create_charuco_board(
+           self.calibration_panel.charuco_squares_x,
+           self.calibration_panel.charuco_squares_y,
+           self.calibration_panel.charuco_square_length,
+           self.calibration_panel.charuco_marker_length,
+           self.calibration_panel.charuco_dict,
+        )
+
         while self.preview_active and self.state.is_running:
             if not self.camera_manager or not dpg.is_dearpygui_running():
                 break
@@ -556,8 +592,121 @@ class VoxelVRApp:
             # Get frames (non-blocking, don't need strict sync for preview)
             frames = self.camera_manager.get_all_latest_frames()
             
+            ext_detections = {}
+            
             for cam_id, frame in frames.items():
-                self.update_camera_frame(cam_id, frame.image)
+                image_to_show = frame.image.copy()
+                
+                # Handle calibration auto-capture if active
+                if self.calibration_panel.state.is_running:
+                    current_step = self.calibration_panel.state.current_step
+                    
+                    # Setup detection
+                    # Board created outside loop for efficiency
+                    
+                    # Determine if we should process this camera
+                    should_detect = False
+                    if current_step == CalibrationStep.INTRINSIC_CAPTURE:
+                        active_cam_id = self.calibration_panel._camera_ids[self.calibration_panel._current_camera_idx]
+                        if cam_id == active_cam_id:
+                            should_detect = True
+                    elif current_step == CalibrationStep.EXTRINSIC_CAPTURE:
+                        should_detect = True
+                        
+                    if should_detect:
+                        res = detect_charuco(frame.image, board, aruco_dict)
+                        
+                        # Use annotated image for display
+                        image_to_show = res['image_with_markers']
+                        
+                        self.calibration_panel.update_board_detection(
+                           cam_id, 
+                           res['success'],
+                           res.get('corners'),
+                           res.get('ids')
+                        )
+                        
+                        if res['success']:
+                            ext_detections[cam_id] = res
+                        
+                        # Intrinsic Auto-Capture
+                        if current_step == CalibrationStep.INTRINSIC_CAPTURE:
+                            if res['success'] and self.calibration_panel.should_auto_capture(cam_id, res['corners']):
+                                if self.calibration_panel.capture_intrinsic_frame(
+                                   cam_id, 
+                                   frame.image, 
+                                   res['corners'], 
+                                   res['ids']
+                                ):
+                                    self._update_calibration_ui()
+                                    # Flash effect?
+                                    cv2.rectangle(image_to_show, (0,0), (image_to_show.shape[1], image_to_show.shape[0]), (0, 255, 0), 10)
+
+                # Update GUI with potentially annotated image
+                self.update_camera_frame(cam_id, image_to_show)
+
+            # Extrinsic Auto-Capture
+            if self.calibration_panel.state.is_running and \
+               self.calibration_panel.state.current_step == CalibrationStep.EXTRINSIC_CAPTURE:
+                
+                # Check if we should attempt a synchronized capture
+                # We do this if ANY camera has seen the board recently (optimization)
+                # or just try for strict sync if we have a hint
+                
+                # If we have synchronized frames available (via CameraManager)
+                if self.camera_manager:
+                    # Sync attempts are expensive so we check if loose detection found anything first
+                    # We check if *any* camera saw the board (relaxed check)
+                    any_visible = any(cd.get('success', False) for cd in ext_detections.values())
+                    
+                    if any_visible:
+                        sync_frames_map = self.camera_manager.get_synchronized_frames(timeout=0.2)
+                        
+                        if sync_frames_map:
+                            # We have a set of tight frames. Detect on ALL of them.
+                            sync_detections = {}
+                            all_sync_visible = True
+                            
+                            for cid, cf in sync_frames_map.items():
+                                res = detect_charuco(cf.image, board, aruco_dict)
+                                if res['success']:
+                                    sync_detections[cid] = res
+                                else:
+                                    all_sync_visible = False
+                                    # Don't break immediately, we might want partial capture logic later,
+                                    # but for standard calibration we need ALL.
+                            
+                            
+                            # Check if ANY camera sees the board in this synchronized set
+                            any_sync_visible = any(res['success'] for res in sync_detections.values())
+                            
+                            if any_sync_visible:
+                                # We have a winner!
+                                # Use first camera that saw it for cooldown check, or just the first available one
+                                first_valid_cam = next((cid for cid, res in sync_detections.items() if res['success']), None)
+                                
+                                if first_valid_cam is not None:
+                                    first_corners = sync_detections[first_valid_cam]['corners']
+                                    
+                                    # Use strict check but relax 'require_all_cameras' since we allow partial
+                                    # We still want to check movement/cooldown
+                                    if self.calibration_panel.should_auto_capture(first_valid_cam, first_corners, require_all_cameras=False):
+                                        
+                                        frames_data = {cid: cf.image for cid, cf in sync_frames_map.items()}
+                                        
+                                        if self.calibration_panel.capture_extrinsic_frame(
+                                            frames_data,
+                                            sync_detections
+                                        ):
+                                            # Update timestamps
+                                            now = time.time()
+                                            for cid in self.calibration_panel._camera_ids:
+                                                self.calibration_panel._last_capture_time[cid] = now
+                                                if cid in sync_detections:
+                                                    self.calibration_panel._last_capture_corners[cid] = sync_detections[cid]['corners']
+                                            
+                                            self._update_calibration_ui()
+                                            print(f"Captured synchronized extrinsic frame set!") 
                 
             time.sleep(0.01)
 
@@ -577,8 +726,8 @@ class VoxelVRApp:
         # Update calibration panel
         self.calibration_panel.set_cameras(detected)
         
-        # Update UI
-        self._update_camera_grid(detected)
+        # Update UI grids
+        self._update_all_camera_grids(detected)
         
         # Start preview
         if detected:
@@ -645,11 +794,10 @@ class VoxelVRApp:
             # Actually STOPPING means it's requesting stop.
             pass
             
-        if state == TrackingState.IDLE:
-             # If we were tracking, and now we are idle, restart preview
+        if state == TrackingState.STOPPED:
+             # If we were tracking, and now we are idle (stopped), restart preview
              if not self.preview_active and self.state.cameras_detected > 0:
                  # Recover known cameras from current panel config
-                 # This is a bit hacky, ideally we store detected IDs in state
                  ids = list(self.camera_panel.frames.keys())
                  if ids:
                      self._start_preview(ids)
@@ -706,27 +854,51 @@ class VoxelVRApp:
     # UI Update methods
     # =========================================================================
     
-    def _update_camera_grid(self, camera_ids: List[int]) -> None:
-        """Update camera grid display."""
-        # Clear existing
-        if dpg.does_item_exist("no_cameras_text"):
-            dpg.delete_item("no_cameras_text")
+    def _update_all_camera_grids(self, camera_ids: List[int]) -> None:
+        """Update all camera grids in different tabs."""
+        # 1. Main Camera Tab
+        self._rebuild_camera_grid("camera_grid", "no_cameras_text", "cam_main", camera_ids, height=500)
+        
+        # 2. Calibration Tab
+        self._rebuild_camera_grid("calib_camera_grid", "calib_no_cameras_text", "cam_calib", camera_ids, height=300)
+        
+        # 3. Tracking Tab
+        self._rebuild_camera_grid("tracking_camera_grid", "tracking_no_cameras_text", "cam_track", camera_ids, height=200)
+
+    def _rebuild_camera_grid(
+        self, 
+        parent_tag: str, 
+        empty_text_tag: str, 
+        item_prefix: str,
+        camera_ids: List[int],
+        height: int = 500
+    ) -> None:
+        """
+        Rebuild a camera grid container.
+        
+        Args:
+            parent_tag: Tag of the child window container
+            empty_text_tag: Tag for the "no cameras" text
+            item_prefix: Prefix for image item tags
+            camera_ids: List of camera IDs to show
+            height: Height of the grid container (unused here as parent handles it)
+        """
+        # Clear existing content
+        dpg.delete_item(parent_tag, children_only=True)
         
         if not camera_ids:
             dpg.add_text(
-                "No cameras detected. Click 'Detect Cameras'.",
-                tag="no_cameras_text",
-                parent="camera_grid",
+                "No cameras active.",
+                tag=empty_text_tag,
+                parent=parent_tag,
             )
             return
-        
-        # Create camera texture placeholders
+
+        # Ensure textures exist
         for cam_id in camera_ids:
-            # Create texture if not exists
             if cam_id not in self._camera_textures:
                 w, h = self.camera_panel.preview_size
-                data = [0.1] * (w * h * 4)  # Dark RGBA
-                
+                data = [0.1] * (w * h * 4)
                 texture_id = dpg.add_dynamic_texture(
                     width=w,
                     height=h,
@@ -734,17 +906,13 @@ class VoxelVRApp:
                     parent=self._texture_registry,
                 )
                 self._camera_textures[cam_id] = texture_id
-        
-        # Clear existing images
-        dpg.delete_item("camera_grid", children_only=True)
-        
-        # Add images to grid
+
+        # Build grid
         cols = 3
-        with dpg.table(parent="camera_grid", header_row=False, policy=dpg.mvTable_SizingFixedFit, resizable=True):
+        with dpg.table(parent=parent_tag, header_row=False, policy=dpg.mvTable_SizingFixedFit, resizable=True):
             for _ in range(cols):
                 dpg.add_table_column()
             
-            # Add rows
             rows = (len(camera_ids) + cols - 1) // cols
             cam_idx = 0
             
@@ -756,8 +924,10 @@ class VoxelVRApp:
                             with dpg.group():
                                 dpg.add_text(f"Camera {cam_id}")
                                 if cam_id in self._camera_textures:
+                                    # Use specific tag for this instance
                                     dpg.add_image(
                                         self._camera_textures[cam_id],
+                                        tag=f"{item_prefix}_{cam_id}",
                                         width=self.camera_panel.preview_size[0],
                                         height=self.camera_panel.preview_size[1],
                                     )
