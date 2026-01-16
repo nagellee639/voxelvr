@@ -79,6 +79,12 @@ class VoxelVRApp:
         self._update_thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
         
+        # Camera Preview
+        from ..capture.manager import CameraManager
+        self.camera_manager: Optional[CameraManager] = None
+        self.preview_thread: Optional[threading.Thread] = None
+        self.preview_active = False
+        
         # External callbacks
         self._on_start_tracking: Optional[Callable] = None
         self._on_stop_tracking: Optional[Callable] = None
@@ -506,16 +512,61 @@ class VoxelVRApp:
     # Callback handlers
     # =========================================================================
     
+    
+    def _start_preview(self, camera_ids: List[int]) -> None:
+        """Start camera preview."""
+        self._stop_preview()
+        
+        print(f"Starting preview for cameras: {camera_ids}")
+        from ..capture.manager import CameraManager
+        from ..config import CameraConfig
+        
+        from ..capture.camera import Camera
+        
+        configs = [
+            CameraConfig(id=i, resolution=Camera.get_best_resolution(i), fps=30) 
+            for i in camera_ids
+        ]
+        
+        self.camera_manager = CameraManager(configs)
+        if self.camera_manager.start_all():
+            self.preview_active = True
+            self.preview_thread = threading.Thread(target=self._preview_loop, daemon=True)
+            self.preview_thread.start()
+        else:
+            print("Failed to start preview cameras")
+
+    def _stop_preview(self) -> None:
+        """Stop camera preview."""
+        self.preview_active = False
+        if self.preview_thread:
+            self.preview_thread.join(timeout=1.0)
+            self.preview_thread = None
+            
+        if self.camera_manager:
+            self.camera_manager.stop_all()
+            self.camera_manager = None
+
+    def _preview_loop(self) -> None:
+        """Background loop for camera preview."""
+        while self.preview_active and self.state.is_running:
+            if not self.camera_manager or not dpg.is_dearpygui_running():
+                break
+                
+            # Get frames (non-blocking, don't need strict sync for preview)
+            frames = self.camera_manager.get_all_latest_frames()
+            
+            for cam_id, frame in frames.items():
+                self.update_camera_frame(cam_id, frame.image)
+                
+            time.sleep(0.01)
+
     def _on_detect_cameras(self, sender, app_data) -> None:
         """Handle detect cameras button."""
         import cv2
         
-        detected = []
-        for i in range(10):
-            cap = cv2.VideoCapture(i)
-            if cap.isOpened():
-                detected.append(i)
-                cap.release()
+        from ..capture.manager import CameraManager
+        detected = CameraManager.detect_cameras()
         
         self.state.cameras_detected = len(detected)
         
@@ -528,6 +579,10 @@ class VoxelVRApp:
         
         # Update UI
         self._update_camera_grid(detected)
+        
+        # Start preview
+        if detected:
+            self._start_preview(detected)
     
     def _on_refresh_cameras(self, sender, app_data) -> None:
         """Handle refresh cameras button."""
@@ -566,9 +621,38 @@ class VoxelVRApp:
         if self.tracking_panel.is_running:
             self.tracking_panel.request_stop()
             dpg.set_item_label("tracking_toggle_btn", "Start Tracking")
+            
+            # Restart preview after tracking stops (simple timeout check or callback?)
+            # Ideally we rely on _on_tracking_state_change, but validation there is cleaner.
         else:
+            # Stop preview to free cameras for tracking thread
+            self._stop_preview()
+            
             self.tracking_panel.request_start()
             dpg.set_item_label("tracking_toggle_btn", "Stop Tracking")
+
+    def _on_tracking_state_change(self, state: TrackingState) -> None:
+        """Handle tracking state changes."""
+        self.state.tracking_active = state == TrackingState.RUNNING
+        
+        if state == TrackingState.STARTING and self._on_start_tracking:
+            self._on_start_tracking()
+        elif state == TrackingState.STOPPING and self._on_stop_tracking:
+            if self._on_stop_tracking:
+                self._on_stop_tracking()
+            
+            # Restart preview when fully stopped (state becomes STOPPED/IDLE)
+            # Actually STOPPING means it's requesting stop.
+            pass
+            
+        if state == TrackingState.IDLE:
+             # If we were tracking, and now we are idle, restart preview
+             if not self.preview_active and self.state.cameras_detected > 0:
+                 # Recover known cameras from current panel config
+                 # This is a bit hacky, ideally we store detected IDs in state
+                 ids = list(self.camera_panel.frames.keys())
+                 if ids:
+                     self._start_preview(ids)
     
     def _on_osc_config_change(self, sender, app_data) -> None:
         """Handle OSC configuration change."""
@@ -643,14 +727,41 @@ class VoxelVRApp:
                 w, h = self.camera_panel.preview_size
                 data = [0.1] * (w * h * 4)  # Dark RGBA
                 
-                texture_id = dpg.add_raw_texture(
+                texture_id = dpg.add_dynamic_texture(
                     width=w,
                     height=h,
                     default_value=data,
-                    format=dpg.mvFormat_Float_rgba,
                     parent=self._texture_registry,
                 )
                 self._camera_textures[cam_id] = texture_id
+        
+        # Clear existing images
+        dpg.delete_item("camera_grid", children_only=True)
+        
+        # Add images to grid
+        cols = 3
+        with dpg.table(parent="camera_grid", header_row=False, policy=dpg.mvTable_SizingFixedFit, resizable=True):
+            for _ in range(cols):
+                dpg.add_table_column()
+            
+            # Add rows
+            rows = (len(camera_ids) + cols - 1) // cols
+            cam_idx = 0
+            
+            for _ in range(rows):
+                with dpg.table_row():
+                    for _ in range(cols):
+                        if cam_idx < len(camera_ids):
+                            cam_id = camera_ids[cam_idx]
+                            with dpg.group():
+                                dpg.add_text(f"Camera {cam_id}")
+                                if cam_id in self._camera_textures:
+                                    dpg.add_image(
+                                        self._camera_textures[cam_id],
+                                        width=self.camera_panel.preview_size[0],
+                                        height=self.camera_panel.preview_size[1],
+                                    )
+                            cam_idx += 1
     
     def _update_calibration_ui(self) -> None:
         """Update calibration tab UI."""

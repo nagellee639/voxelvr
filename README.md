@@ -21,6 +21,7 @@ python run_gui.py
 
 The GUI provides:
 - **Camera Preview** - View all camera feeds for positioning
+- **Camera Errors**: If camera detection fails or logs errors, ensure your user has permission to access video devices (e.g., `sudo usermod -a -G video $USER`). VoxelVR now automatically detects available `/dev/video*` devices on Linux.
 - **Calibration Wizard** - Step-by-step ChArUco board calibration
 - **Tracking Controls** - Start/stop tracking with OSC configuration
 - **Performance Monitor** - Real-time FPS and latency graphs

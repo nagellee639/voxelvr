@@ -9,7 +9,7 @@ import cv2
 import numpy as np
 import threading
 import time
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 from dataclasses import dataclass
 from queue import Queue, Empty
 
@@ -96,6 +96,86 @@ class Camera:
         
         return True
     
+        return True
+    
+    @staticmethod
+    def probe_resolutions(camera_id: int, min_fps: int = 30) -> List[Tuple[int, int, float]]:
+        """
+        Probe supported resolutions and FPS for a camera.
+        
+        Args:
+            camera_id: Camera index
+            min_fps: Target FPS to probe for
+            
+        Returns:
+            List of supported (width, height, fps) tuples
+        """
+        import sys
+        
+        # Define resolutions to check (standard 4:3 and 16:9 aspect ratios)
+        common_resolutions = [
+            (1920, 1080), # FHD
+            (1280, 720),  # HD
+            (1024, 768),  # XGA
+            (800, 600),   # SVGA
+            (640, 480),   # VGA
+        ]
+        
+        supported = []
+        
+        try:
+            # Use appropriate backend on Linux to avoid issues if needed
+            cap = cv2.VideoCapture(camera_id)
+            if not cap.isOpened():
+                return []
+                
+            for w, h in common_resolutions:
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, w)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
+                cap.set(cv2.CAP_PROP_FPS, min_fps)
+                
+                actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                actual_fps = cap.get(cv2.CAP_PROP_FPS)
+                
+                # Check if we got something valid
+                if actual_w > 0 and actual_h > 0:
+                    cfg = (actual_w, actual_h, actual_fps)
+                    if cfg not in supported:
+                        supported.append(cfg)
+                        
+            cap.release()
+        except Exception:
+            pass
+            
+        return supported
+
+    @staticmethod
+    def get_best_configuration(camera_id: int, target_fps: int = 30) -> Tuple[int, int, int]:
+        """
+        Get best camera configuration (w, h, fps).
+        Prioritizes maintaining target_fps, then maximizes resolution.
+        """
+        supported = Camera.probe_resolutions(camera_id, min_fps=target_fps)
+        
+        if not supported:
+            return (640, 480, 30) # Safe default
+            
+        # Filter for configs that meet target FPS (within small margin)
+        # Some cameras report 30.00003 or 29.97
+        good_fps = [c for c in supported if c[2] >= target_fps - 1.0]
+        
+        if good_fps:
+            # Found configs with good FPS, pick highest resolution
+            good_fps.sort(key=lambda x: x[0] * x[1], reverse=True)
+            best = good_fps[0]
+            return (best[0], best[1], int(best[2]))
+            
+        # If no config meets target FPS, pick highest FPS available
+        supported.sort(key=lambda x: x[2], reverse=True)
+        best = supported[0]
+        return (best[0], best[1], int(best[2]))
+
     def stop(self) -> None:
         """Stop the camera capture thread."""
         self._running = False

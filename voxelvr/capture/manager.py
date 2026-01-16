@@ -55,9 +55,12 @@ class CameraManager:
         self.configs[config.id] = config
         return True
     
-    def detect_cameras(self, max_cameras: int = 10) -> List[int]:
+    @staticmethod
+    def detect_cameras(max_cameras: int = 10) -> List[int]:
         """
         Auto-detect available cameras.
+        
+        Uses /dev/video* globbing on Linux to avoid OpenCV error spam.
         
         Args:
             max_cameras: Maximum number of cameras to check
@@ -65,13 +68,54 @@ class CameraManager:
         Returns:
             List of available camera IDs
         """
+        import sys
+        import glob
+        import os
+        
         available = []
-        for i in range(max_cameras):
+        candidates = []
+        
+        # On Linux, check /dev/video* first to identify potential cameras
+        if sys.platform.startswith('linux'):
+            # Find all video devices
+            devices = glob.glob('/dev/video*')
+            for dev in devices:
+                # Extract index
+                try:
+                    idx = int(dev.replace('/dev/video', ''))
+                    candidates.append(idx)
+                except ValueError:
+                    pass
+            candidates.sort()
+            
+            # Limit to max_count if specified (though valid indices can be high)
+            if not candidates:
+                # Fallback to naive iteration if glob fails
+                candidates = list(range(max_cameras))
+        else:
+            candidates = list(range(max_cameras))
+            
+        # Suppress OpenCV errors during probing
+        # We can't easily suppress C++ stderr from Python without pipes,
+        # but we can try to rely on valid candidates to minimize failures.
+        
+        for i in candidates:
+            # Skip if we already found enough?
+            # No, let's find all available within reason.
+            
+            # Only check if index < max_cameras to prevent excessive probing of virtual devices?
+            # Users might have plugged in cameras at high indices.
+            
+            # Use CAP_V4L2 backend explicitly on Linux if needed, or default.
             cap = cv2.VideoCapture(i)
             if cap.isOpened():
-                available.append(i)
+                # Read a frame to verify it's a real camera (some meta devices open but don't stream)
+                ret, _ = cap.read()
+                if ret:
+                    available.append(i)
                 cap.release()
-        return available
+                
+        return sorted(available)
     
     def start_all(self) -> bool:
         """Start all cameras."""
