@@ -44,7 +44,8 @@ python run_tracking.py
 - Python 3.10+
 - 3+ USB webcams
 - GPU with DirectML/CUDA/ROCm support
-- ChArUco calibration board (printable from GUI or CLI)
+- ChArUco calibration board (printable as PDF from GUI or CLI)
+- A4 or Letter paper for printing the board (default 5x5 is sized for standard paper)
 
 ## GUI Features
 
@@ -53,7 +54,7 @@ View all connected cameras in a flexible grid layout. Useful for positioning cam
 
 ### Calibration Wizard
 Step-by-step guidance for calibrating your camera system:
-1. Export and print the ChArUco calibration board
+1. Export and print the ChArUco calibration board (PDF format)
 2. Capture intrinsic frames for each camera
 3. Capture extrinsic frames with all cameras seeing the board
 4. Review calibration quality metrics

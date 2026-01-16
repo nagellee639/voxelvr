@@ -28,7 +28,7 @@ ARUCO_DICTS = {
 
 
 def create_charuco_board(
-    squares_x: int = 7,
+    squares_x: int = 5,
     squares_y: int = 5,
     square_length: float = 0.04,  # meters
     marker_length: float = 0.03,  # meters
@@ -134,28 +134,17 @@ def detect_charuco(
     return result
 
 
-def generate_charuco_pdf(
-    output_path: Path,
-    squares_x: int = 7,
+def generate_charuco_img(
+    squares_x: int = 5,
     squares_y: int = 5,
     square_length: float = 0.04,
     marker_length: float = 0.03,
     dictionary: str = "DICT_6X6_250",
     dpi: int = 300,
-    page_size: Tuple[float, float] = (8.5, 11),  # inches (letter size)
-) -> None:
+) -> np.ndarray:
     """
-    Generate a printable ChArUco board image.
-    
-    Args:
-        output_path: Path to save the image
-        squares_x: Number of squares in X
-        squares_y: Number of squares in Y
-        square_length: Square size in meters
-        marker_length: Marker size in meters
-        dictionary: ArUco dictionary name
-        dpi: Dots per inch for output
-        page_size: Page size in inches (width, height)
+    Generate a ChArUco board image for display or legacy PNG export.
+    Returns: BGR numpy image
     """
     board, aruco_dict = create_charuco_board(
         squares_x, squares_y, square_length, marker_length, dictionary
@@ -183,18 +172,115 @@ def generate_charuco_pdf(
     canvas[border:border+img_height, border:border+img_width] = board_img
     
     # Add calibration info
-    info_text = f"ChArUco Board: {squares_x}x{squares_y} | Square: {square_length*100:.1f}cm | Marker: {marker_length*100:.1f}cm"
+    info_text = f"ChArUco: {squares_x}x{squares_y} | Sq: {square_length*100:.1f}cm | Mk: {marker_length*100:.1f}cm"
     cv2.putText(
         canvas, info_text, 
         (border, img_height + border + 50),
         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2
     )
     
+    return canvas
+
+
+def generate_charuco_pdf_file(
+    output_path: Path,
+    squares_x: int = 5,
+    squares_y: int = 5,
+    square_length: float = 0.04,
+    marker_length: float = 0.03,
+    dictionary: str = "DICT_6X6_250",
+) -> None:
+    """
+    Generate a printable PDF ChArUco board using FPDF.
+    
+    Args:
+        output_path: Path to save the PDF
+        squares_x: Number of squares in X
+        squares_y: Number of squares in Y
+        square_length: Square size in meters
+        marker_length: Marker size in meters
+        dictionary: ArUco dictionary name
+    """
+    try:
+        from fpdf import FPDF
+    except ImportError:
+        print("fpdf not found. Please install: pip install fpdf")
+        return
+
+    # Create PDF (A4 size: 210x297mm, Letter: 215.9x279.4mm)
+    # Using Letter size as generic default, but centering the image
+    pdf = FPDF(orientation='P', unit='mm', format='Letter')
+    pdf.add_page()
+    
+    # Original board width in mm
+    board_w_mm = squares_x * square_length * 1000
+    board_h_mm = squares_y * square_length * 1000
+    
+    # Generate just the board raw image for precise scaling in PDF
+    # We use a high resolution temp image
+    board, _ = create_charuco_board(squares_x, squares_y, square_length, marker_length, dictionary)
+    w_px = int(squares_x * square_length * 300 / 0.0254) # 300 DPI
+    h_px = int(squares_y * square_length * 300 / 0.0254)
+    raw_board_img = board.generateImage((w_px, h_px), marginSize=0)
+    
+    # Save temp image
+    temp_img_path = output_path.with_suffix('.temp.png')
+    cv2.imwrite(str(temp_img_path), raw_board_img)
+
+    # Center on page
+    page_w = 215.9
+    page_h = 279.4
+    x = (page_w - board_w_mm) / 2
+    y = (page_h - board_h_mm) / 2
+    
+    # Verify it fits
+    if x < 0 or y < 0:
+        print(f"Warning: Board size ({board_w_mm:.1f}x{board_h_mm:.1f}mm) is too large for page!")
+    
+    pdf.image(str(temp_img_path), x=x, y=y, w=board_w_mm, h=board_h_mm)
+    
+    # Add text
+    pdf.set_xy(x, y + board_h_mm + 5)
+    pdf.set_font("Arial", size=12)
+    pdf.cell(0, 10, f"VoxelVR Calibration | {squares_x}x{squares_y} | Square: {square_length*100:.1f}cm | Marker: {marker_length*100:.1f}cm", align='C')
+    pdf.ln(5)
+    pdf.cell(0, 10, "PRINT AT 100% SCALE (DO NOT SCALE TO FIT)", align='C')
+    
+    pdf.output(str(output_path))
+    
+    # Cleanup
+    if temp_img_path.exists():
+        temp_img_path.unlink()
+        
+    print(f"ChArUco board PDF saved to: {output_path}")
+
+
+def generate_charuco_pdf(
+    output_path: Path,
+    squares_x: int = 5,
+    squares_y: int = 5,
+    square_length: float = 0.04,
+    marker_length: float = 0.03,
+    dictionary: str = "DICT_6X6_250",
+    dpi: int = 300,
+    page_size: Tuple[float, float] = (8.5, 11),
+) -> None:
+    """
+    Legacy wrapper. Checks extension:
+    - If .pdf, calls generate_charuco_pdf_file
+    - If .png/.jpg, generates image and saves it
+    """
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    cv2.imwrite(str(output_path), canvas)
-    print(f"ChArUco board saved to: {output_path}")
-    print(f"Print at 100% scale. Square size: {square_length*100:.1f}cm")
+    
+    if output_path.suffix.lower() == '.pdf':
+        generate_charuco_pdf_file(
+            output_path, squares_x, squares_y, square_length, marker_length, dictionary
+        )
+    else:
+        img = generate_charuco_img(squares_x, squares_y, square_length, marker_length, dictionary, dpi)
+        cv2.imwrite(str(output_path), img)
+        print(f"ChArUco board image saved to: {output_path}")
 
 
 def estimate_pose(

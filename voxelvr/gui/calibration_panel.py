@@ -62,7 +62,7 @@ class CalibrationPanel:
     
     def __init__(
         self,
-        charuco_squares_x: int = 7,
+        charuco_squares_x: int = 5,
         charuco_squares_y: int = 5,
         charuco_square_length: float = 0.04,
         charuco_marker_length: float = 0.03,
@@ -296,12 +296,13 @@ class CalibrationPanel:
             True if successful
         """
         try:
-            from ..calibration.charuco import generate_charuco_pdf
+            from ..calibration.charuco import generate_charuco_pdf_file
             
-            # Generate PNG first (existing function)
-            png_path = output_path.with_suffix('.png')
-            generate_charuco_pdf(
-                png_path,
+            # Ensure PDF extension
+            pdf_path = output_path.with_suffix('.pdf')
+            
+            generate_charuco_pdf_file(
+                pdf_path,
                 self.charuco_squares_x,
                 self.charuco_squares_y,
                 self.charuco_square_length,
@@ -309,12 +310,12 @@ class CalibrationPanel:
                 self.charuco_dict,
             )
             
-            # If user wants PDF, we can convert (or just provide the PNG)
-            # For now, return the PNG path
+            print(f"Exported calibration board to {pdf_path}")
             return True
             
         except Exception as e:
             self._state.error_message = f"Failed to export board: {e}"
+            print(f"Export error: {e}")
             return False
     
     def update_board_detection(

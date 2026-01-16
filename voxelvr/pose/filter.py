@@ -190,10 +190,29 @@ class PoseFilter:
         if valid_mask is None:
             valid_mask = np.ones(self.num_joints, dtype=bool)
         
+        # Robustness check: ignore updates with NaNs
+        if np.any(np.isnan(positions)):
+            # If input is junk, return previous state or just input (if first frame)
+            # Ideally we want to return the last valid filtered state
+            # For now, let's just use the current valid state without updating
+            if any(f.filters[0].x_prev is not None for f in self.joint_filters.values()):
+                # Construct result from current filter states
+                result = np.zeros_like(positions)
+                for i in range(self.num_joints):
+                     # Current estimated position
+                     result[i] = [
+                         self.joint_filters[i].filters[0].x_prev if self.joint_filters[i].filters[0].x_prev is not None else positions[i,0],
+                         self.joint_filters[i].filters[1].x_prev if self.joint_filters[i].filters[1].x_prev is not None else positions[i,1],
+                         self.joint_filters[i].filters[2].x_prev if self.joint_filters[i].filters[2].x_prev is not None else positions[i,2],
+                     ]
+                return result
+            else:
+                return np.nan_to_num(positions) # Return zeros if first frame is NaN
+        
         filtered = positions.copy()
         
         for i in range(min(self.num_joints, len(positions))):
-            if valid_mask[i]:
+            if valid_mask[i] and not np.any(np.isnan(positions[i])):
                 filtered[i] = self.joint_filters[i].filter(positions[i], timestamp)
             # If joint is invalid, we could either:
             # 1. Reset the filter (causes jump when joint becomes valid)
