@@ -97,7 +97,3 @@ voxelvr/
 | Balanced | General VR | Low | ~50ms |
 | Low Latency | Gaming, fast movement | Medium | ~20ms |
 | Precision | Slow motion, yoga | Very Low | ~60ms |
-
-## License
-
-MIT
