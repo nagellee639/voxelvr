@@ -157,9 +157,10 @@ def calibrate_intrinsics(
     # Try using optimized C++ implementation
     use_cpp = False
     try:
-        from .calibration_cpp_v2 import batch_detect_charuco
-        use_cpp = True
-        print("Using optimized C++ calibration backend")
+        if False: # Force Python implementation for dataset validation
+            from .calibration_cpp_v2 import batch_detect_charuco
+            use_cpp = True
+            print("Using optimized C++ calibration backend")
     except ImportError:
         print("C++ extension not found, using Python implementation")
 
