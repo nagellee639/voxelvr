@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.env
+venv/
+env/
+
+# Project specifics
+dataset/
+output/
+*.mp4
+*.avi
+*.jpg
+*.png

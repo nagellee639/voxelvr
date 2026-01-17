@@ -16,11 +16,7 @@ class CalibrationStep(Enum):
     """Calibration workflow steps."""
     IDLE = "idle"
     EXPORT_BOARD = "export_board"
-    INTRINSIC_CAPTURE = "intrinsic_capture"
-    INTRINSIC_COMPUTE = "intrinsic_compute"
-    EXTRINSIC_CAPTURE = "extrinsic_capture"
-    EXTRINSIC_COMPUTE = "extrinsic_compute"
-    VERIFICATION = "verification"
+    CALIBRATION = "calibration"  # Unified intrinsics + extrinsics
     COMPLETE = "complete"
 
 
@@ -29,12 +25,29 @@ class CameraCalibrationStatus:
     """Calibration status for a single camera."""
     camera_id: int
     board_visible: bool = False
-    intrinsic_frames: int = 0
-    intrinsic_required: int = 20
+    
+    # Intrinsic progress
+    intrinsic_frames_captured: int = 0
+    intrinsic_frames_required: int = 20
     intrinsic_complete: bool = False
+    intrinsic_result: Optional[Any] = None  # CameraIntrinsics when complete
     intrinsic_error: float = 0.0
-    extrinsic_complete: bool = False
-    extrinsic_error: float = 0.0
+    intrinsic_computing: bool = False
+    
+    # Pairwise extrinsics (frames captured with each other camera)
+    pairwise_frames: Dict[int, int] = field(default_factory=dict)
+    pairwise_required: int = 10  # Frames needed per camera pair
+
+
+
+@dataclass
+class ExtrinsicsProgress:
+    """Overall extrinsics calibration progress (all cameras simultaneously)."""
+    all_cameras_frames: int = 0
+    all_cameras_required: int = 30
+    complete: bool = False
+    result: Optional[Any] = None  # MultiCameraCalibration when complete
+    computing: bool = False
 
 
 @dataclass
@@ -42,8 +55,7 @@ class CalibrationState:
     """Overall calibration state."""
     current_step: CalibrationStep = CalibrationStep.IDLE
     cameras: Dict[int, CameraCalibrationStatus] = field(default_factory=dict)
-    extrinsic_frames: int = 0
-    extrinsic_required: int = 30
+    extrinsics: ExtrinsicsProgress = field(default_factory=ExtrinsicsProgress)
     all_cameras_visible: bool = False
     error_message: str = ""
     is_running: bool = False
@@ -93,16 +105,18 @@ class CalibrationPanel:
         
         # State
         self._state = CalibrationState()
+        self._state.extrinsics.all_cameras_required = extrinsic_frames_required
         self._camera_ids: List[int] = []
-        self._current_camera_idx = 0
         
         # Callbacks
         self._step_callbacks: List[Callable[[CalibrationStep], None]] = []
         self._progress_callbacks: List[Callable[[CalibrationState], None]] = []
         
         # Captured data storage
-        self._intrinsic_frames: Dict[int, List[np.ndarray]] = {}
-        self._extrinsic_captures: List[Dict[int, Any]] = []
+        # intrinsic_frames: Dict[cam_id, List[Dict with 'frame', 'corners', 'ids']]
+        self._intrinsic_frames: Dict[int, List[Dict[str, Any]]] = {}
+        # extrinsic_captures: List of synchronized multi-camera captures
+        self._extrinsic_captures: List[Dict[str, Any]] = []
         
         # Board detection results
         self._board = None
@@ -113,6 +127,9 @@ class CalibrationPanel:
         self._last_capture_corners: Dict[int, np.ndarray] = {}
         self._capture_cooldown = 1.0  # Seconds
         self._movement_threshold = 50.0  # Pixel distance sum
+        
+        # Background computation
+        self._computation_threads: Dict[int, Any] = {}  # cam_id -> thread
     
     @property
     def state(self) -> CalibrationState:
@@ -135,7 +152,7 @@ class CalibrationPanel:
         self._state.cameras = {
             cam_id: CameraCalibrationStatus(
                 camera_id=cam_id,
-                intrinsic_required=self.intrinsic_frames_required,
+                intrinsic_frames_required=self.intrinsic_frames_required,
             )
             for cam_id in camera_ids
         }
@@ -181,47 +198,21 @@ class CalibrationPanel:
                 "2. Print at 100% scale (no scaling)\n"
                 "3. Measure a square to verify it matches the expected size\n"
                 "4. Attach the board to a flat, rigid surface\n"
-                "5. Click 'Next' when ready"
+                "5. Click 'Start Calibration' when ready"
             )
         
-        elif step == CalibrationStep.INTRINSIC_CAPTURE:
-            cam_id = self._camera_ids[self._current_camera_idx]
-            status = self._state.cameras[cam_id]
-            return (
-                f"Step 2: Intrinsic Calibration - Camera {cam_id}\n\n"
-                f"Captured: {status.intrinsic_frames}/{status.intrinsic_required} frames\n\n"
-                "1. Hold the ChArUco board in front of this camera\n"
-                "2. Move the board to different positions and angles\n"
-                "3. Include corners and edges of the camera view\n"
-                "4. Press SPACE or click 'Capture' when the board is visible\n"
-                "5. Each position should show the board at a different angle"
-            )
-        
-        elif step == CalibrationStep.INTRINSIC_COMPUTE:
-            return "Computing intrinsic parameters... Please wait."
-        
-        elif step == CalibrationStep.EXTRINSIC_CAPTURE:
+        elif step == CalibrationStep.CALIBRATION:
             visible_count = sum(1 for s in self._state.cameras.values() if s.board_visible)
             return (
-                "Step 3: Extrinsic Calibration (Multi-Camera)\n\n"
-                f"Captured: {self._state.extrinsic_frames}/{self._state.extrinsic_required} frames\n"
+                "Step 2: Calibration (Intrinsics + Extrinsics)\n\n"
                 f"Cameras seeing board: {visible_count}/{len(self._camera_ids)}\n\n"
-                "1. Hold the ChArUco board in the center of your play area\n"
-                "2. Make sure ALL cameras can see the board simultaneously\n"
-                "3. Wave the board slowly around the center area\n"
-                "4. Frames are captured automatically when all cameras see the board"
-            )
-        
-        elif step == CalibrationStep.EXTRINSIC_COMPUTE:
-            return "Computing extrinsic parameters... Please wait."
-        
-        elif step == CalibrationStep.VERIFICATION:
-            return (
-                "Step 4: Verification\n\n"
-                "Calibration complete! Review the quality metrics below.\n\n"
-                "A reprojection error under 0.5 pixels is excellent.\n"
-                "Under 1.0 pixels is good.\n"
-                "Over 2.0 pixels may cause tracking issues."
+                "Move the ChArUco board around your tracking space:\n"
+                "• Hold it in front of each camera from different angles\n"
+                "• Include corners and edges of each camera's view\n"
+                "• When multiple cameras see it, we capture extrinsics too\n"
+                "• For best results, show it to all cameras together\n\n"
+                "Progress bars below show what still needs to be captured.\n"
+                "Frames are captured automatically based on movement."
             )
         
         elif step == CalibrationStep.COMPLETE:
@@ -230,6 +221,7 @@ class CalibrationPanel:
                 "Your cameras are now calibrated and ready for tracking.\n"
                 "You can close this panel and start tracking."
             )
+        
         
         return ""
     

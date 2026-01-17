@@ -88,6 +88,10 @@ class Camera:
         actual_height = int(self._cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         actual_fps = self._cap.get(cv2.CAP_PROP_FPS)
         
+        # Update state with actual values
+        self.resolution = (actual_width, actual_height)
+        self.target_fps = actual_fps if actual_fps > 0 else self.target_fps
+        
         print(f"Camera {self.camera_id}: {actual_width}x{actual_height} @ {actual_fps:.1f} FPS")
         
         self._running = True

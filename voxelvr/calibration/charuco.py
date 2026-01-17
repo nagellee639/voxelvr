@@ -304,8 +304,27 @@ def estimate_pose(
     if corners is None or len(corners) < 4:
         return False, None, None
     
-    success, rvec, tvec = cv2.aruco.estimatePoseCharucoBoard(
-        corners, ids, board, camera_matrix, distortion_coeffs, None, None
-    )
-    
-    return success, rvec, tvec
+    # Manually match points since estimatePoseCharucoBoard is deprecated/missing
+    try:
+        # Get all board corners (N_total, 3)
+        all_board_corners = board.getChessboardCorners()
+        
+        # Select the ones we see
+        # ids is (N, 1) or (N,), flatten to indexing array
+        obj_points = all_board_corners[ids.flatten()]
+        
+        # corners is (N, 1, 2) or (N, 2), solvePnP handles both
+        
+        success, rvec, tvec = cv2.solvePnP(
+            obj_points,
+            corners,
+            camera_matrix,
+            distortion_coeffs,
+            flags=cv2.SOLVEPNP_ITERATIVE
+        )
+        
+        return success, rvec, tvec
+        
+    except Exception as e:
+        print(f"Pose estimation failed: {e}")
+        return False, None, None

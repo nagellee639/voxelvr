@@ -1,0 +1,7 @@
+setup.py
+cpp/optimization.cpp
+voxelvr.calibration.calibration_cpp.egg-info/PKG-INFO
+voxelvr.calibration.calibration_cpp.egg-info/SOURCES.txt
+voxelvr.calibration.calibration_cpp.egg-info/dependency_links.txt
+voxelvr.calibration.calibration_cpp.egg-info/requires.txt
+voxelvr.calibration.calibration_cpp.egg-info/top_level.txt

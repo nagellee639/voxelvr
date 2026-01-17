@@ -16,8 +16,8 @@ class get_pybind_include(object):
 # Add /usr/include/opencv4 to include_dirs based on findings
 ext_modules = [
     Extension(
-        'voxelvr.calibration.calibration_cpp',
-        ['voxelvr/calibration/cpp/optimization.cpp'],
+        'calibration_cpp_v2',
+        ['cpp/optimization.cpp'],
         include_dirs=[
             # Path to pybind11 headers
             get_pybind_include(),

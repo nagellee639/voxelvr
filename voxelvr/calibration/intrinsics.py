@@ -114,6 +114,8 @@ def capture_intrinsic_frames(
     return frames
 
 
+import time
+
 def calibrate_intrinsics(
     frames: List[np.ndarray],
     config: CalibrationConfig,
@@ -149,15 +151,75 @@ def calibrate_intrinsics(
     all_ids = []
     image_size = None
     
-    for i, frame in enumerate(frames):
-        if image_size is None:
-            image_size = (frame.shape[1], frame.shape[0])
+    if len(frames) > 0:
+        image_size = (frames[0].shape[1], frames[0].shape[0])
+
+    # Try using optimized C++ implementation
+    use_cpp = False
+    try:
+        from .calibration_cpp_v2 import batch_detect_charuco
+        use_cpp = True
+        print("Using optimized C++ calibration backend")
+    except ImportError:
+        print("C++ extension not found, using Python implementation")
+
+    total_frames = len(frames)
+    print(f"Processing {total_frames} frames...")
+    
+    start_time = time.time()
+    
+    def progress_callback(current, total):
+        elapsed = time.time() - start_time
+        if current > 0 and elapsed > 0.1:
+            rate = current / elapsed
+            remaining_sec = (total - current) / rate
+            mins, secs = divmod(int(remaining_sec), 60)
+            time_str = f"{mins}m{secs:02d}s"
+        else:
+            time_str = "??m??s"
+            
+        percent = (current / total) * 100
+        bar_len = 30
+        filled = int(percent / 100 * bar_len)
+        bar = '=' * filled + '-' * (bar_len - filled)
         
-        result = detect_charuco(frame, board, aruco_dict)
-        
-        if result['success'] and len(result['corners']) >= 4:
-            all_corners.append(result['corners'])
-            all_ids.append(result['ids'])
+        print(f"\rProgress: [{bar}] {percent:5.1f}% | Est. Remaining: {time_str}   ", end="", flush=True)
+
+    if use_cpp:
+        # Process all frames at once with C++ and callback
+        try:
+            results = batch_detect_charuco(
+                [np.ascontiguousarray(f, dtype=np.uint8) for f in frames],
+                int(config.charuco_squares_x),
+                int(config.charuco_squares_y),
+                float(config.charuco_square_length),
+                float(config.charuco_marker_length),
+                str(config.charuco_dict),
+                progress_callback
+            )
+            
+            for res in results:
+                if res.get('success') and res.get('corners') is not None and len(res['corners']) >= 4:
+                    all_corners.append(res['corners'])
+                    all_ids.append(res['ids'])
+                    
+        except Exception as e:
+            print(f"\nBatch processing error: {e}")
+            print("Falling back to Python implementation...")
+            use_cpp = False
+    
+    if not use_cpp:
+        # Python fallback (per frame)
+        for i, frame in enumerate(frames):
+            result = detect_charuco(frame, board, aruco_dict)
+            if result['success'] and len(result['corners']) >= 4:
+                all_corners.append(result['corners'])
+                all_ids.append(result['ids'])
+            
+            # Update progress manually for python
+            progress_callback(i + 1, total_frames)
+
+    print("\nProcessing complete.")
     
     if len(all_corners) < 5:
         print(f"Error: Only {len(all_corners)} valid frames, need at least 5")
@@ -165,11 +227,28 @@ def calibrate_intrinsics(
     
     print(f"Calibrating with {len(all_corners)} frames...")
     
+    # Prepare data for calibration
+    # Since cv2.aruco.calibrateCameraCharuco might be missing, we do it manually
+    obj_points = []
+    img_points = []
+    
+    board_corners = board.getChessboardCorners()
+    
+    for i in range(len(all_corners)):
+        current_ids = all_ids[i].flatten()
+        current_corners = all_corners[i]
+        
+        # Select object points corresponding to detected IDs
+        # board_corners is (Total, 3), we treat it as list/array
+        current_obj_points = board_corners[current_ids]
+        
+        obj_points.append(current_obj_points)
+        img_points.append(current_corners)
+    
     # Calibrate
-    ret, camera_matrix, dist_coeffs, rvecs, tvecs = cv2.aruco.calibrateCameraCharuco(
-        all_corners,
-        all_ids,
-        board,
+    ret, camera_matrix, dist_coeffs, rvecs, tvecs = cv2.calibrateCamera(
+        obj_points,
+        img_points,
         image_size,
         None,
         None,

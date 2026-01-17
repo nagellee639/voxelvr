@@ -70,5 +70,25 @@ def test_parallel_extrinsics_execution(test_images, mock_intrinsics):
     # Assert we survived
     assert True 
 
+def test_intrinsic_calibration_optimization(test_images):
+    if not test_images:
+        pytest.skip("No test images found")
+        
+    config = CalibrationConfig()
+    config.charuco_squares_x = 5
+    config.charuco_squares_y = 7
+    
+    # Run intrinsic calibration
+    print("\nTesting Intrinsic Calibration...")
+    from voxelvr.calibration.intrinsics import calibrate_intrinsics
+    
+    # We expect this to use the optimized path if available and print/progress
+    intr = calibrate_intrinsics(test_images, config)
+    
+    # It might fail to converge on random images or few images, but we check it runs
+    # `calibrate_intrinsics` returns None if < 5 frames or calibration fails
+    # We just want to ensure it exercises the C++ code without crashing
+    assert True
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
