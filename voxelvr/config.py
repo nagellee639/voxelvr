@@ -60,6 +60,12 @@ class TrackingConfig(BaseModel):
     filter_beta: float = 0.5  # Higher = less lag during fast motion
     filter_d_cutoff: float = 1.0
     
+    # Confidence-based view filtering
+    confidence_threshold: float = 0.3  # Minimum confidence for valid detection
+    confidence_grace_period_frames: int = 7  # Frames before requiring reactivation
+    confidence_reactivation_frames: int = 3  # Consecutive frames to reactivate
+    freeze_unconfident_joints: bool = True  # Freeze joints when all views unconfident
+    
     # Performance
     target_fps: int = 30
     max_persons: int = 1  # For now, single person tracking

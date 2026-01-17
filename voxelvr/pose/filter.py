@@ -142,6 +142,8 @@ class PoseFilter:
         min_cutoff: float = 1.0,
         beta: float = 0.5,
         d_cutoff: float = 1.0,
+        init_pose: Optional[np.ndarray] = None,
+        freeze_invalid_joints: bool = True,
     ):
         """
         Initialize pose filter.
@@ -151,16 +153,31 @@ class PoseFilter:
             min_cutoff: Minimum cutoff frequency (lower = more smoothing)
             beta: Speed coefficient (higher = less lag during movement)
             d_cutoff: Cutoff for derivative estimation
+            init_pose: Initial pose (num_joints, 3), defaults to T-pose
+            freeze_invalid_joints: Whether to freeze invalid joints at last known position
         """
         self.num_joints = num_joints
         self.min_cutoff = min_cutoff
         self.beta = beta
         self.d_cutoff = d_cutoff
+        self.freeze_invalid_joints = freeze_invalid_joints
         
         self.joint_filters: Dict[int, OneEuroFilter3D] = {}
         
         for i in range(num_joints):
             self.joint_filters[i] = OneEuroFilter3D(min_cutoff, beta, d_cutoff)
+        
+        # Last known confident positions (for freezing)
+        if init_pose is not None:
+            self.last_confident_positions = init_pose.copy()
+        else:
+            # Import T-pose from confidence_filter
+            try:
+                from .confidence_filter import create_tpose
+                self.last_confident_positions = create_tpose()
+            except ImportError:
+                # Fallback if confidence_filter not available
+                self.last_confident_positions = np.zeros((num_joints, 3), dtype=np.float32)
     
     def reset(self) -> None:
         """Reset all filters."""
@@ -182,7 +199,7 @@ class PoseFilter:
             timestamp: Current timestamp
             
         Returns:
-            Filtered (num_joints, 3) positions
+            Filtered (num_joints, 3) positions (with frozen joints if enabled)
         """
         if timestamp is None:
             timestamp = time.time()
@@ -213,11 +230,15 @@ class PoseFilter:
         
         for i in range(min(self.num_joints, len(positions))):
             if valid_mask[i] and not np.any(np.isnan(positions[i])):
+                # Valid joint: filter and update last known position
                 filtered[i] = self.joint_filters[i].filter(positions[i], timestamp)
-            # If joint is invalid, we could either:
-            # 1. Reset the filter (causes jump when joint becomes valid)
-            # 2. Keep last value (maintains continuity)
-            # Currently keeping last value by not updating
+                if self.freeze_invalid_joints:
+                    self.last_confident_positions[i] = filtered[i]
+            else:
+                # Invalid joint: freeze at last known position
+                if self.freeze_invalid_joints:
+                    filtered[i] = self.last_confident_positions[i]
+                # If not freezing, keep the (possibly invalid) input value
         
         return filtered
     

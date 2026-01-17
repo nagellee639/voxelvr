@@ -4,6 +4,7 @@
 from .triangulation import triangulate_points, triangulate_pose
 from .filter import OneEuroFilter, PoseFilter
 from .rotation import estimate_all_rotations, TrackerRotations, RotationFilter
+from .confidence_filter import ConfidenceFilter, create_tpose
 
 # OpenCV-dependent modules (optional import)
 try:
@@ -22,4 +23,7 @@ __all__ = [
     "estimate_all_rotations",
     "TrackerRotations",
     "RotationFilter",
+    "ConfidenceFilter",
+    "create_tpose",
 ]
+

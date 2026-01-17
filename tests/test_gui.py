@@ -430,9 +430,13 @@ class TestCalibrationPanel:
         panel.start_calibration()
         assert panel.current_step == CalibrationStep.EXPORT_BOARD
         
-        # Next: to intrinsic capture
-        panel.next_step()
-        assert panel.current_step == CalibrationStep.INTRINSIC_CAPTURE
+        # Begin: to calibration phase
+        panel.begin_calibration()
+        assert panel.current_step == CalibrationStep.CALIBRATION
+        
+        # Finish
+        panel.finish_calibration()
+        assert panel.current_step == CalibrationStep.COMPLETE
     
     def test_calibration_cancel(self):
         """Test canceling calibration."""

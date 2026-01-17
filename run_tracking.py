@@ -28,7 +28,7 @@ from voxelvr.config import (
     CameraExtrinsics,
 )
 from voxelvr.capture import CameraManager
-from voxelvr.pose import PoseDetector2D, PoseFilter
+from voxelvr.pose import PoseDetector2D, PoseFilter, ConfidenceFilter
 from voxelvr.pose.triangulation import TriangulationPipeline, compute_projection_matrices
 from voxelvr.transport import OSCSender, CoordinateTransform
 from voxelvr.transport.osc_sender import pose_to_trackers_with_rotations
@@ -72,6 +72,11 @@ def main():
         action="store_true",
         help="Disable temporal filtering"
     )
+    parser.add_argument(
+        "--no-confidence-filter",
+        action="store_true",
+        help="Disable confidence-based view filtering"
+    )
     
     args = parser.parse_args()
     
@@ -108,7 +113,7 @@ def main():
     
     # Create pose detector
     print("Loading pose detection model...")
-    detector = PoseDetector2D(confidence_threshold=0.3)
+    detector = PoseDetector2D(confidence_threshold=config.tracking.confidence_threshold)
     if not detector.load_model():
         print("Failed to load pose model!")
         return 1
@@ -125,13 +130,22 @@ def main():
     projection_matrices = compute_projection_matrices(intrinsics_list, extrinsics_list)
     
     # Create triangulation pipeline
-    triangulation = TriangulationPipeline(projection_matrices, confidence_threshold=0.3)
+    triangulation = TriangulationPipeline(projection_matrices, confidence_threshold=config.tracking.confidence_threshold)
+    
+    # Create confidence filter
+    confidence_filter = ConfidenceFilter(
+        num_joints=17,
+        confidence_threshold=config.tracking.confidence_threshold,
+        grace_period_frames=config.tracking.confidence_grace_period_frames,
+        reactivation_frames=config.tracking.confidence_reactivation_frames,
+    ) if not args.no_confidence_filter else None
     
     # Create pose filter
     pose_filter = PoseFilter(
         num_joints=17,
         min_cutoff=config.tracking.filter_min_cutoff,
         beta=config.tracking.filter_beta,
+        freeze_invalid_joints=config.tracking.freeze_unconfident_joints,
     ) if not args.no_filter else None
     
     # Create rotation filter (smoother alpha for rotations)
@@ -194,11 +208,25 @@ def main():
                 if kp:
                     keypoints_2d[cam_id] = kp
             
+            # Apply confidence filtering
+            filtered_keypoints = list(keypoints_2d.values())
+            conf_diagnostics = None
+            if confidence_filter:
+                filtered_keypoints, conf_diagnostics = confidence_filter.update(filtered_keypoints)
+            
             # 3D triangulation
             pose_3d = None
-            if len(keypoints_2d) >= 2:
-                kp_list = list(keypoints_2d.values())
-                pose_3d = triangulation.process(kp_list)
+            if len(filtered_keypoints) >= 2:
+                pose_3d = triangulation.process(filtered_keypoints)
+            
+            # Apply confidence-based joint freezing
+            if pose_3d and confidence_filter:
+                pose_3d['positions'] = confidence_filter.apply_freezing(
+                    pose_3d['positions'],
+                    pose_3d['valid'],
+                )
+                # Update valid mask since frozen joints are now "valid"
+                pose_3d['valid'] = np.ones(17, dtype=bool)
             
             # Apply temporal filter
             if pose_3d and pose_filter:
@@ -265,7 +293,18 @@ def main():
                 valid_joints = np.sum(pose_3d['valid']) if pose_3d else 0
                 trackers_sent = len(trackers) if pose_3d else 0
                 
-                print(f"\rFPS: {fps:.1f} | Joints: {valid_joints}/17 | Trackers: {trackers_sent} | Frames: {frame_count}", end="")
+                status = f"\rFPS: {fps:.1f} | Joints: {valid_joints}/17 | Trackers: {trackers_sent}"
+                
+                # Add confidence filtering info
+                if conf_diagnostics:
+                    active_views = conf_diagnostics['active_views_per_joint']
+                    min_views = int(np.min(active_views))
+                    max_views = int(np.max(active_views))
+                    avg_views = float(np.mean(active_views))
+                    status += f" | Views: {min_views}-{max_views} (avg {avg_views:.1f})"
+                
+                status += f" | Frames: {frame_count}"
+                print(status, end="")
                 last_status_time = current_time
             
     except KeyboardInterrupt:

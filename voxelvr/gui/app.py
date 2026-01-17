@@ -20,6 +20,7 @@ from .performance_panel import PerformancePanel, PerformanceMetrics
 from .debug_panel import DebugPanel
 from .osc_status import OSCStatusIndicator, ConnectionState
 from .param_optimizer import ParameterOptimizer, FilterProfile
+from .skeleton_viewer import SkeletonViewer
 
 
 @dataclass
@@ -71,10 +72,12 @@ class VoxelVRApp:
         self.performance_panel = PerformancePanel()
         self.debug_panel = DebugPanel()
         self.osc_status = OSCStatusIndicator()
+        self.skeleton_viewer = SkeletonViewer(size=(600, 600))
         
         # DearPyGui IDs
         self._texture_registry: Optional[int] = None
         self._camera_textures: Dict[int, int] = {}
+        self._skeleton_texture: Optional[int] = None
         
         # Update thread
         self._update_thread: Optional[threading.Thread] = None
@@ -156,8 +159,19 @@ class VoxelVRApp:
         dpg.create_context()
         dpg.create_viewport(title=self.title, width=self.width, height=self.height)
         
-        # Create texture registry for camera feeds
+        # Create texture registry for camera feeds and skeleton viewer
         self._texture_registry = dpg.add_texture_registry()
+        
+        # Create skeleton viewer texture
+        skeleton_w, skeleton_h = self.skeleton_viewer.size
+        placeholder = self.skeleton_viewer.render_placeholder()
+        self._skeleton_texture = dpg.add_dynamic_texture(
+            width=skeleton_w,
+            height=skeleton_h,
+            default_value=placeholder.flatten().tolist(),
+            parent=self._texture_registry,
+            tag="skeleton_texture"
+        )
         
         # Setup theme
         self._setup_theme()
@@ -286,9 +300,15 @@ class VoxelVRApp:
                     callback=self._on_export_board_click,
                 )
                 dpg.add_button(
-                    label="Next Step",
-                    tag="calib_next_btn",
-                    callback=self._on_calibration_next_click,
+                    label="Begin Calibration",
+                    tag="calib_begin_btn",
+                    callback=self._on_calibration_begin_click,
+                    enabled=False,
+                )
+                dpg.add_button(
+                    label="Finish",
+                    tag="calib_finish_btn",
+                    callback=self._on_calibration_finish_click,
                     enabled=False,
                 )
                 dpg.add_button(
@@ -308,10 +328,10 @@ class VoxelVRApp:
             
             dpg.add_separator()
             
-            # Camera status grid
-            dpg.add_text("Camera Status:", color=(150, 150, 150))
-            with dpg.child_window(tag="calib_camera_status", height=100, autosize_x=True):
-                dpg.add_text("Configure cameras first.", tag="calib_no_cameras")
+            # Progress bars (for unified calibration)
+            dpg.add_text("Calibration Progress:", color=(150, 150, 150))
+            with dpg.child_window(tag="calib_progress_container", height=150, autosize_x=True):
+                dpg.add_text("Progress will appear here during calibration.", tag="calib_progress_placeholder")
     
     def _create_tracking_tab(self) -> None:
         """Create the tracking tab."""
@@ -410,13 +430,54 @@ class VoxelVRApp:
                     
                     with dpg.group():
                         dpg.add_text("Latency")
-                        dpg.add_text("-- ms", tag="perf_latency", color=(100, 200, 100))
+                        dpg.add_text("--  ms", tag="perf_latency", color=(100, 200, 100))
                     
                     dpg.add_spacer(width=30)
                     
                     with dpg.group():
                         dpg.add_text("Joints")
                         dpg.add_text("--/17", tag="perf_joints", color=(100, 200, 100))
+            
+            dpg.add_separator()
+            
+            # 3D Skeleton Viewer section
+            dpg.add_text("3D Skeleton View", color=(150, 150, 150))
+            with dpg.child_window(autosize_x=True, height=500):
+                # Controls row
+                with dpg.group(horizontal=True):
+                    dpg.add_checkbox(
+                        label="Auto-Rotate",
+                        tag="skeleton_auto_rotate",
+                        default_value=True,
+                        callback=lambda s, a: self.skeleton_viewer.set_auto_rotate(a) if hasattr(self, 'skeleton_viewer') else None
+                    )
+                    dpg.add_slider_float(
+                        label="Speed",
+                        tag="skeleton_rotation_speed",
+                        default_value=1.0,
+                        min_value=0.1,
+                        max_value=5.0,
+                        width=100,
+                        callback=lambda s, a: self.skeleton_viewer.set_rotation_speed(a) if hasattr(self, 'skeleton_viewer') else None
+                    )
+                    dpg.add_slider_float(
+                        label="Elevation",
+                        tag="skeleton_elevation",
+                        default_value=15.0,
+                        min_value=-90.0,
+                        max_value=90.0,
+                        width=100,
+                        callback=lambda s, a: self.skeleton_viewer.set_elevation(a) if hasattr(self, 'skeleton_viewer') else None
+                    )
+                    dpg.add_button(
+                        label="Reset View",
+                        callback=lambda: self.skeleton_viewer.reset_view() if hasattr(self, 'skeleton_viewer') else None
+                    )
+                
+                dpg.add_spacer(height=5)
+                
+                # 3D view (will be populated with skeleton render)
+                dpg.add_image("skeleton_texture", tag="skeleton_display")
     
     def _create_debug_tab(self) -> None:
         """Create the debug tab."""
@@ -592,121 +653,51 @@ class VoxelVRApp:
             # Get frames (non-blocking, don't need strict sync for preview)
             frames = self.camera_manager.get_all_latest_frames()
             
-            ext_detections = {}
-            
-            for cam_id, frame in frames.items():
-                image_to_show = frame.image.copy()
-                
-                # Handle calibration auto-capture if active
-                if self.calibration_panel.state.is_running:
-                    current_step = self.calibration_panel.state.current_step
-                    
-                    # Setup detection
-                    # Board created outside loop for efficiency
-                    
-                    # Determine if we should process this camera
-                    should_detect = False
-                    if current_step == CalibrationStep.INTRINSIC_CAPTURE:
-                        active_cam_id = self.calibration_panel._camera_ids[self.calibration_panel._current_camera_idx]
-                        if cam_id == active_cam_id:
-                            should_detect = True
-                    elif current_step == CalibrationStep.EXTRINSIC_CAPTURE:
-                        should_detect = True
-                        
-                    if should_detect:
-                        res = detect_charuco(frame.image, board, aruco_dict)
-                        
-                        # Use annotated image for display
-                        image_to_show = res['image_with_markers']
-                        
-                        self.calibration_panel.update_board_detection(
-                           cam_id, 
-                           res['success'],
-                           res.get('corners'),
-                           res.get('ids')
-                        )
-                        
-                        if res['success']:
-                            ext_detections[cam_id] = res
-                        
-                        # Intrinsic Auto-Capture
-                        if current_step == CalibrationStep.INTRINSIC_CAPTURE:
-                            if res['success'] and self.calibration_panel.should_auto_capture(cam_id, res['corners']):
-                                if self.calibration_panel.capture_intrinsic_frame(
-                                   cam_id, 
-                                   frame.image, 
-                                   res['corners'], 
-                                   res['ids']
-                                ):
-                                    self._update_calibration_ui()
-                                    # Flash effect?
-                                    cv2.rectangle(image_to_show, (0,0), (image_to_show.shape[1], image_to_show.shape[0]), (0, 255, 0), 10)
-
-                # Update GUI with potentially annotated image
-                self.update_camera_frame(cam_id, image_to_show)
-
-            # Extrinsic Auto-Capture
+            # Handle calibration auto-capture if active
             if self.calibration_panel.state.is_running and \
-               self.calibration_panel.state.current_step == CalibrationStep.EXTRINSIC_CAPTURE:
+               self.calibration_panel.state.current_step == CalibrationStep.CALIBRATION:
                 
-                # Check if we should attempt a synchronized capture
-                # We do this if ANY camera has seen the board recently (optimization)
-                # or just try for strict sync if we have a hint
-                
-                # If we have synchronized frames available (via CameraManager)
-                if self.camera_manager:
-                    # Sync attempts are expensive so we check if loose detection found anything first
-                    # We check if *any* camera saw the board (relaxed check)
-                    any_visible = any(cd.get('success', False) for cd in ext_detections.values())
+                # Detect on all cameras
+                all_detections = {}
+                for cam_id, frame in frames.items():
+                    res = detect_charuco(frame.image, board, aruco_dict)
                     
-                    if any_visible:
-                        sync_frames_map = self.camera_manager.get_synchronized_frames(timeout=0.2)
-                        
-                        if sync_frames_map:
-                            # We have a set of tight frames. Detect on ALL of them.
-                            sync_detections = {}
-                            all_sync_visible = True
-                            
-                            for cid, cf in sync_frames_map.items():
-                                res = detect_charuco(cf.image, board, aruco_dict)
-                                if res['success']:
-                                    sync_detections[cid] = res
-                                else:
-                                    all_sync_visible = False
-                                    # Don't break immediately, we might want partial capture logic later,
-                                    # but for standard calibration we need ALL.
-                            
-                            
-                            # Check if ANY camera sees the board in this synchronized set
-                            any_sync_visible = any(res['success'] for res in sync_detections.values())
-                            
-                            if any_sync_visible:
-                                # We have a winner!
-                                # Use first camera that saw it for cooldown check, or just the first available one
-                                first_valid_cam = next((cid for cid, res in sync_detections.items() if res['success']), None)
-                                
-                                if first_valid_cam is not None:
-                                    first_corners = sync_detections[first_valid_cam]['corners']
-                                    
-                                    # Use strict check but relax 'require_all_cameras' since we allow partial
-                                    # We still want to check movement/cooldown
-                                    if self.calibration_panel.should_auto_capture(first_valid_cam, first_corners, require_all_cameras=False):
-                                        
-                                        frames_data = {cid: cf.image for cid, cf in sync_frames_map.items()}
-                                        
-                                        if self.calibration_panel.capture_extrinsic_frame(
-                                            frames_data,
-                                            sync_detections
-                                        ):
-                                            # Update timestamps
-                                            now = time.time()
-                                            for cid in self.calibration_panel._camera_ids:
-                                                self.calibration_panel._last_capture_time[cid] = now
-                                                if cid in sync_detections:
-                                                    self.calibration_panel._last_capture_corners[cid] = sync_detections[cid]['corners']
-                                            
-                                            self._update_calibration_ui()
-                                            print(f"Captured synchronized extrinsic frame set!") 
+                    # Add frame to detection result for capture
+                    res['frame'] = frame.image
+                    all_detections[cam_id] = res
+                
+                # Process all detections through unified logic
+                capture_result = self.calibration_panel.process_frame_detections(all_detections)
+                
+                # Update UI if anything was captured
+                if capture_result['intrinsics_captured'] or \
+                   capture_result['pairwise_captured'] or \
+                   capture_result['all_cameras_captured']:
+                    self._update_calibration_ui()
+                
+                # Update camera frames with annotated images
+                for cam_id, det in all_detections.items():
+                    image_to_show = det.get('image_with_markers', frames[cam_id].image)
+                    
+                    # Add flash effect if captured for intrinsics
+                    if cam_id in capture_result['intrinsics_captured']:
+                        import cv2
+                        cv2.rectangle(image_to_show, (0,0), 
+                                    (image_to_show.shape[1], image_to_show.shape[0]), 
+                                    (0, 255, 0), 10)
+                    
+                    # Blue flash if captured for all cameras
+                    if capture_result['all_cameras_captured']:
+                        import cv2
+                        cv2.rectangle(image_to_show, (0,0), 
+                                    (image_to_show.shape[1], image_to_show.shape[0]), 
+                                    (255, 215, 0), 15)  # Gold color
+                    
+                    self.update_camera_frame(cam_id, image_to_show)
+            else:
+                # Not calibrating, just show frames
+                for cam_id, frame in frames.items():
+                    self.update_camera_frame(cam_id, frame.image) 
                 
             time.sleep(0.01)
 
@@ -755,9 +746,14 @@ class VoxelVRApp:
         if self.calibration_panel.export_board_pdf(output_path):
             print(f"Board exported to: {output_path}")
     
-    def _on_calibration_next_click(self, sender, app_data) -> None:
-        """Handle calibration next button."""
-        self.calibration_panel.next_step()
+    def _on_calibration_begin_click(self, sender, app_data) -> None:
+        """Handle begin calibration button."""
+        self.calibration_panel.begin_calibration()
+        self._update_calibration_ui()
+    
+    def _on_calibration_finish_click(self, sender, app_data) -> None:
+        """Handle finish calibration button."""
+        self.calibration_panel.finish_calibration()
         self._update_calibration_ui()
     
     def _on_calibration_cancel_click(self, sender, app_data) -> None:
@@ -942,11 +938,7 @@ class VoxelVRApp:
         step_names = {
             CalibrationStep.IDLE: "Not Started",
             CalibrationStep.EXPORT_BOARD: "1. Export Board",
-            CalibrationStep.INTRINSIC_CAPTURE: "2. Intrinsic Calibration",
-            CalibrationStep.INTRINSIC_COMPUTE: "2. Computing...",
-            CalibrationStep.EXTRINSIC_CAPTURE: "3. Extrinsic Calibration",
-            CalibrationStep.EXTRINSIC_COMPUTE: "3. Computing...",
-            CalibrationStep.VERIFICATION: "4. Verification",
+            CalibrationStep.CALIBRATION: "2. Calibration In Progress",
             CalibrationStep.COMPLETE: "Complete!",
         }
         dpg.set_value("calib_step_text", step_names.get(step, "Unknown"))
@@ -957,12 +949,86 @@ class VoxelVRApp:
         # Update buttons
         is_running = state.is_running
         dpg.configure_item("calib_start_btn", enabled=not is_running)
-        dpg.configure_item("calib_next_btn", enabled=is_running and step not in [
-            CalibrationStep.INTRINSIC_COMPUTE,
-            CalibrationStep.EXTRINSIC_COMPUTE,
-            CalibrationStep.COMPLETE,
-        ])
+        dpg.configure_item("calib_begin_btn", enabled=is_running and step == CalibrationStep.EXPORT_BOARD)
+        
+        # Enable finish when all calibration is complete
+        progress = self.calibration_panel.get_progress_summary()
+        can_finish = is_running and step == CalibrationStep.CALIBRATION and progress.get('all_ready', False)
+        dpg.configure_item("calib_finish_btn", enabled=can_finish)
         dpg.configure_item("calib_cancel_btn", enabled=is_running)
+        
+        # Update progress bars
+        if step == CalibrationStep.CALIBRATION:
+            self._update_calibration_progress()
+    
+    def _update_calibration_progress(self) -> None:
+        """Update calibration progress bars."""
+        progress = self.calibration_panel.get_progress_summary()
+        
+        # Clear and rebuild progress container
+        if dpg.does_item_exist("calib_progress_container"):
+            dpg.delete_item("calib_progress_container", children_only=True)
+            
+            cameras = progress.get('cameras', {})
+            
+            # Add per-camera progress bars
+            for cam_id in sorted(cameras.keys()):
+                cam_progress = cameras[cam_id]
+                intrinsic_pct = cam_progress['intrinsic_percent']
+                frames_captured = cam_progress['intrinsic_frames']
+                frames_required = cam_progress['intrinsic_required']
+                is_complete = cam_progress['intrinsic_complete']
+                is_computing = cam_progress['intrinsic_computing']
+                is_visible = cam_progress['board_visible']
+                
+                with dpg.group(horizontal=True, parent="calib_progress_container"):
+                    # Camera label with visibility indicator
+                    vis_indicator = "👁" if is_visible else "  "
+                    status = ""
+                    if is_complete:
+                        status = " ✓"
+                    elif is_computing:
+                        status = " (computing...)"
+                    
+                    label_text = f"{vis_indicator} Camera {cam_id}:"
+                    dpg.add_text(label_text, tag=f"calib_cam_{cam_id}_label")
+                    
+                    # Progress bar
+                    dpg.add_progress_bar(
+                        default_value=intrinsic_pct / 100.0,
+                        tag=f"calib_cam_{cam_id}_bar",
+                        width=200,
+                    )
+                    
+                    # Frame count label
+                    count_text = f"{frames_captured}/{frames_required}{status}"
+                    dpg.add_text(count_text, tag=f"calib_cam_{cam_id}_count")
+            
+            # Add overall extrinsics progress
+            dpg.add_separator(parent="calib_progress_container")
+            
+            overall_pct = progress['overall_extrinsics_percent']
+            overall_frames = progress['overall_extrinsics_frames']
+            overall_required = progress['overall_extrinsics_required']
+            overall_complete = progress['overall_extrinsics_complete']
+            overall_computing = progress['overall_extrinsics_computing']
+            
+            with dpg.group(horizontal=True, parent="calib_progress_container"):
+                status = ""
+                if overall_complete:
+                    status = " ✓"
+                elif overall_computing:
+                    status = " (computing...)"
+                
+                dpg.add_text("Overall Extrinsics:", tag="calib_overall_label")
+                dpg.add_progress_bar(
+                    default_value=overall_pct / 100.0,
+                    tag="calib_overall_bar",
+                    width=200,
+                )
+                count_text = f"{overall_frames}/{overall_required}{status}"
+                dpg.add_text(count_text, tag="calib_overall_count")
+    
     
     def _update_debug_sliders(self) -> None:
         """Update debug sliders from current values."""
@@ -1030,11 +1096,47 @@ class VoxelVRApp:
             if camera_id in frames:
                 dpg.set_value(self._camera_textures[camera_id], frames[camera_id].tolist())
     
+    def update_skeleton_view(self, keypoints_3d: Optional[np.ndarray] = None, confidences: Optional[np.ndarray] = None) -> None:
+        """
+        Update the 3D skeleton visualization.
+        
+        Args:
+            keypoints_3d: (17, 3) array of 3D joint positions in meters, or None for placeholder
+            confidences: (17,) array of confidence scores (0-1), or None for default
+        """
+        if keypoints_3d is None:
+            # Render placeholder
+            img_array = self.skeleton_viewer.render_placeholder("Waiting for tracking data...")
+        else:
+            # Render skeleton
+            img_array = self.skeleton_viewer.render_skeleton(keypoints_3d, confidences)
+        
+        # Update texture
+        if self._skeleton_texture is not None:
+            dpg.set_value(self._skeleton_texture, img_array.flatten().tolist())
+    
     def run(self) -> None:
         """Run the application main loop."""
         self.setup()
         
+        last_skeleton_update = time.time()
+        skeleton_update_interval = 1.0 / 30.0  # 30 FPS for skeleton viewer
+        
         while dpg.is_dearpygui_running() and self.state.is_running:
+            # Update skeleton viewer if tracking is active
+            now = time.time()
+            if now - last_skeleton_update >= skeleton_update_interval:
+                if self.tracking_panel.is_running:
+                    pose = self.tracking_panel.get_current_pose()
+                    if pose is not None:
+                        self.update_skeleton_view(pose['positions'], pose.get('confidences'))
+                    else:
+                        self.update_skeleton_view()  # Show placeholder
+                else:
+                    # Not tracking, just rotate the placeholder
+                    self.update_skeleton_view()
+                last_skeleton_update = now
+            
             dpg.render_dearpygui_frame()
         
         self.shutdown()

@@ -236,6 +236,13 @@ class CalibrationPanel:
         self._state.error_message = ""
         self._notify_step_change()
     
+    def begin_calibration(self) -> None:
+        """Begin the actual calibration capture phase."""
+        self._state.current_step = CalibrationStep.CALIBRATION
+        self._intrinsic_frames = {cam_id: [] for cam_id in self._camera_ids}
+        self._extrinsic_captures = []
+        self._notify_step_change()
+    
     def cancel_calibration(self) -> None:
         """Cancel the current calibration."""
         self._state.is_running = False
@@ -244,47 +251,13 @@ class CalibrationPanel:
         self._extrinsic_captures.clear()
         self._notify_step_change()
     
-    def next_step(self) -> None:
-        """Advance to the next calibration step."""
-        step = self._state.current_step
-        
-        if step == CalibrationStep.EXPORT_BOARD:
-            self._state.current_step = CalibrationStep.INTRINSIC_CAPTURE
-            self._current_camera_idx = 0
-            self._intrinsic_frames = {cam_id: [] for cam_id in self._camera_ids}
-        
-        elif step == CalibrationStep.INTRINSIC_CAPTURE:
-            # Check if we have enough frames for current camera
-            cam_id = self._camera_ids[self._current_camera_idx]
-            status = self._state.cameras[cam_id]
-            
-            if status.intrinsic_frames >= self.intrinsic_frames_required:
-                # Compute intrinsics for this camera
-                self._state.current_step = CalibrationStep.INTRINSIC_COMPUTE
-        
-        elif step == CalibrationStep.INTRINSIC_COMPUTE:
-            # Move to next camera or extrinsic calibration
-            self._current_camera_idx += 1
-            if self._current_camera_idx < len(self._camera_ids):
-                self._state.current_step = CalibrationStep.INTRINSIC_CAPTURE
-            else:
-                self._state.current_step = CalibrationStep.EXTRINSIC_CAPTURE
-                self._state.extrinsic_frames = 0
-        
-        elif step == CalibrationStep.EXTRINSIC_CAPTURE:
-            if self._state.extrinsic_frames >= self.extrinsic_frames_required:
-                self._state.current_step = CalibrationStep.EXTRINSIC_COMPUTE
-        
-        elif step == CalibrationStep.EXTRINSIC_COMPUTE:
-            self._state.current_step = CalibrationStep.VERIFICATION
-        
-        elif step == CalibrationStep.VERIFICATION:
-            self._state.current_step = CalibrationStep.COMPLETE
-            self._state.is_running = False
-        
+    
+    def finish_calibration(self) -> None:
+        """Mark calibration as complete."""
+        self._state.current_step = CalibrationStep.COMPLETE
+        self._state.is_running = False
         self._notify_step_change()
     
-        self._notify_step_change()
     
     def toggle_auto_capture(self) -> None:
         """Toggle auto-capture mode."""
@@ -372,6 +345,308 @@ class CalibrationPanel:
             self._state.error_message = f"Failed to export board: {e}"
             print(f"Export error: {e}")
             return False
+    
+    
+    def process_frame_detections(
+        self,
+        detections: Dict[int, Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        """
+        Process detection results from all cameras and automatically capture frames.
+        
+        Args:
+            detections: Dict mapping camera_id to detection result with keys:
+                - 'success': bool
+                - 'corners': np.ndarray (if success)
+                - 'ids': np.ndarray (if success)
+                - 'frame': np.ndarray (optional, for capture)
+        
+        Returns:
+            Dict with capture information:
+                - 'intrinsics_captured': List[int] (camera IDs)
+                - 'pairwise_captured': List[Tuple[int, int]] (camera ID pairs)
+                - 'all_cameras_captured': bool
+        """
+        if self._state.current_step != CalibrationStep.CALIBRATION:
+            return {'intrinsics_captured': [], 'pairwise_captured': [], 'all_cameras_captured': False}
+        
+        if not self._state.auto_capture:
+            return {'intrinsics_captured': [], 'pairwise_captured': [], 'all_cameras_captured': False}
+        
+        now = time.time()
+        result = {
+            'intrinsics_captured': [],
+            'pairwise_captured': [],
+            'all_cameras_captured': False
+        }
+        
+        # Update visibility status for all cameras
+        visible_cameras = []
+        for cam_id in self._camera_ids:
+            det = detections.get(cam_id, {})
+            is_visible = det.get('success', False)
+            self._state.cameras[cam_id].board_visible = is_visible
+            if is_visible:
+                visible_cameras.append(cam_id)
+        
+        self._state.all_cameras_visible = len(visible_cameras) == len(self._camera_ids)
+        
+        # Process each visible camera for intrinsic capture
+        for cam_id in visible_cameras:
+            det = detections[cam_id]
+            corners = det.get('corners')
+            
+            if corners is None or len(corners) < 4:
+                continue
+            
+            # Check if this camera needs more intrinsic frames
+            status = self._state.cameras[cam_id]
+            if status.intrinsic_frames_captured >= status.intrinsic_frames_required:
+                continue  # Already have enough
+            
+            if status.intrinsic_computing:
+                continue  # Computation in progress
+            
+            # Check cooldown
+            last_time = self._last_capture_time.get(cam_id, 0)
+            if now - last_time < self._capture_cooldown:
+                continue
+            
+            # Check movement
+            if cam_id in self._last_capture_corners:
+                last_corners = self._last_capture_corners[cam_id]
+                if len(corners) == len(last_corners):
+                    try:
+                        dist = np.linalg.norm(corners - last_corners, axis=2)
+                        mean_dist = np.mean(dist)
+                        if mean_dist < self._movement_threshold:
+                            continue  # Not enough movement
+                    except Exception:
+                        pass  # Shape mismatch, treat as new pose
+            
+            # Capture for intrinsics!
+            frame = det.get('frame')
+            ids = det.get('ids')
+            
+            if frame is not None and ids is not None:
+                self._intrinsic_frames[cam_id].append({
+                    'frame': frame.copy(),
+                    'corners': corners.copy(),
+                    'ids': ids.copy(),
+                })
+                
+                status.intrinsic_frames_captured = len(self._intrinsic_frames[cam_id])
+                self._last_capture_time[cam_id] = now
+                self._last_capture_corners[cam_id] = corners.copy()
+                
+                result['intrinsics_captured'].append(cam_id)
+                
+                # Check if we should trigger computation
+                if status.intrinsic_frames_captured >= status.intrinsic_frames_required:
+                    self._trigger_intrinsic_computation(cam_id)
+        
+        # Process pairwise extrinsics (when 2+ cameras see the board)
+        if len(visible_cameras) >= 2:
+            # For simplicity, we'll  use the first visible camera's cooldown as reference
+            ref_cam = visible_cameras[0]
+            ref_time = self._last_capture_time.get(ref_cam, 0)
+            
+            if now - ref_time >= self._capture_cooldown:
+                # Capture for all visible pairs
+                for i, cam1 in enumerate(visible_cameras):
+                    for cam2 in visible_cameras[i+1:]:
+                        result['pairwise_captured'].append((cam1, cam2))
+                        
+                        # Track pairwise progress
+                        if cam2 not in self._state.cameras[cam1].pairwise_frames:
+                            self._state.cameras[cam1].pairwise_frames[cam2] = 0
+                        if cam1 not in self._state.cameras[cam2].pairwise_frames:
+                            self._state.cameras[cam2].pairwise_frames[cam1] = 0
+                        
+                        self._state.cameras[cam1].pairwise_frames[cam2] += 1
+                        self._state.cameras[cam2].pairwise_frames[cam1] += 1
+        
+        # Process overall extrinsics (when ALL cameras see the board)
+        if self._state.all_cameras_visible:
+            if self._state.extrinsics.all_cameras_frames < self._state.extrinsics.all_cameras_required:
+                # Check global cooldown (use first camera)
+                if len(visible_cameras) > 0:
+                    ref_cam = visible_cameras[0]
+                    ref_time = self._last_capture_time.get(ref_cam, 0)
+                    
+                    if now - ref_time >= self._capture_cooldown:
+                        # Capture synchronized frame set
+                        frames_data = {}
+                        detections_data = {}
+                        
+                        for cam_id in visible_cameras:
+                            det = detections[cam_id]
+                            frames_data[cam_id] = det.get('frame')
+                            detections_data[cam_id] = det
+                        
+                        self._extrinsic_captures.append({
+                            'frames': frames_data,
+                            'detections': detections_data,
+                            'timestamp': now,
+                        })
+                        
+                        self._state.extrinsics.all_cameras_frames = len(self._extrinsic_captures)
+                        result['all_cameras_captured'] = True
+                        
+                        # Update all camera timestamps
+                        for cam_id in visible_cameras:
+                            self._last_capture_time[cam_id] = now
+                        
+                        # Check if we should trigger computation
+                        if self._state.extrinsics.all_cameras_frames >= self._state.extrinsics.all_cameras_required:
+                            self._trigger_extrinsic_computation()
+        
+        self._notify_progress()
+        return result
+    
+    def get_progress_summary(self) -> Dict[str, Any]:
+        """
+        Get current calibration progress for UI display.
+        
+        Returns dict with progress information for all cameras and overall extrinsics.
+        """
+        cameras_progress = {}
+        
+        for cam_id, status in self._state.cameras.items():
+            intrinsic_percent = min(100, int(100 * status.intrinsic_frames_captured / status.intrinsic_frames_required))
+            
+            # Calculate average pairwise progress
+            pairwise_total = 0
+            pairwise_count = 0
+            for other_cam, count in status.pairwise_frames.items():
+                pairwise_total += min(100, int(100 * count / status.pairwise_required))
+                pairwise_count += 1
+            
+            pairwise_percent = pairwise_total // pairwise_count if pairwise_count > 0 else 0
+            
+            cameras_progress[cam_id] = {
+                'intrinsic_percent': intrinsic_percent,
+                'intrinsic_frames': status.intrinsic_frames_captured,
+                'intrinsic_required': status.intrinsic_frames_required,
+                'intrinsic_complete': status.intrinsic_complete,
+                'intrinsic_computing': status.intrinsic_computing,
+                'pairwise_percent': pairwise_percent,
+                'board_visible': status.board_visible,
+            }
+        
+        overall_extrinsics_percent = min(100, int(100 * self._state.extrinsics.all_cameras_frames / self._state.extrinsics.all_cameras_required))
+        all_intrinsics_complete = all(s.intrinsic_complete for s in self._state.cameras.values())
+        all_ready = all_intrinsics_complete and self._state.extrinsics.complete
+        
+        return {
+            'cameras': cameras_progress,
+            'overall_extrinsics_percent': overall_extrinsics_percent,
+            'overall_extrinsics_frames': self._state.extrinsics.all_cameras_frames,
+            'overall_extrinsics_required': self._state.extrinsics.all_cameras_required,
+            'overall_extrinsics_complete': self._state.extrinsics.complete,
+            'overall_extrinsics_computing': self._state.extrinsics.computing,
+            'all_intrinsics_complete': all_intrinsics_complete,
+            'all_ready': all_ready,
+            'all_cameras_visible': self._state.all_cameras_visible,
+        }
+    
+    def _trigger_intrinsic_computation(self, camera_id: int) -> None:
+        """Trigger background computation of intrinsic calibration for a camera."""
+        import threading
+        from ..calibration.intrinsics import calibrate_intrinsics
+        from ..config import CalibrationConfig
+        
+        status = self._state.cameras[camera_id]
+        status.intrinsic_computing = True
+        
+        def compute():
+            try:
+                # Extract frames from captured data
+                frames = [cap['frame'] for cap in self._intrinsic_frames[camera_id]]
+                
+                # Create config
+                config = CalibrationConfig(
+                    charuco_squares_x=self.charuco_squares_x,
+                    charuco_squares_y=self.charuco_squares_y,
+                    charuco_square_length=self.charuco_square_length,
+                    charuco_marker_length=self.charuco_marker_length,
+                    charuco_dict=self.charuco_dict,
+                )
+                
+                # Compute
+                result = calibrate_intrinsics(frames, config, camera_id, f"Camera {camera_id}")
+                
+                if result:
+                    status.intrinsic_complete = True
+                    status.intrinsic_result = result
+                    status.intrinsic_error = result.reprojection_error
+                    print(f"Camera {camera_id} intrinsics complete! Error: {result.reprojection_error:.3f}")
+                else:
+                    print(f"Camera {camera_id} intrinsics computation failed")
+                
+            except Exception as e:
+                print(f"Error computing intrinsics for camera {camera_id}: {e}")
+            finally:
+                status.intrinsic_computing = False
+                self._notify_progress()
+        
+        thread = threading.Thread(target=compute, daemon=True)
+        self._computation_threads[camera_id] = thread
+        thread.start()
+    
+    def _trigger_extrinsic_computation(self) -> None:
+        """Trigger background computation of overall extrinsic calibration."""
+        import threading
+        from ..calibration.extrinsics import calibrate_extrinsics
+        from ..config import CalibrationConfig
+        
+        self._state.extrinsics.computing = True
+        
+        def compute():
+            try:
+                # Wait for all intrinsics to complete
+                while not all(s.intrinsic_complete for s in self._state.cameras.values()):
+                    time.sleep(0.5)
+                
+                # Prepare intrinsics list
+                intrinsics_list = [s.intrinsic_result for s in self._state.cameras.values()]
+                
+                # Prepare captures (convert to expected format)
+                captures = []
+                for cap_data in self._extrinsic_captures:
+                    captures.append(cap_data['frames'])
+                
+                # Create config
+                config = CalibrationConfig(
+                    charuco_squares_x=self.charuco_squares_x,
+                    charuco_squares_y=self.charuco_squares_y,
+                    charuco_square_length=self.charuco_square_length,
+                    charuco_marker_length=self.charuco_marker_length,
+                    charuco_dict=self.charuco_dict,
+                )
+                
+                # Compute
+                result = calibrate_extrinsics(captures, intrinsics_list, config)
+                
+                if result:
+                    self._state.extrinsics.complete = True
+                    self._state.extrinsics.result = result
+                    print(f"Extrinsics calibration complete!")
+                else:
+                    print(f"Extrinsics calibration failed")
+                
+            except Exception as e:
+                print(f"Error computing extrinsics: {e}")
+                import traceback
+                traceback.print_exc()
+            finally:
+                self._state.extrinsics.computing = False
+                self._notify_progress()
+        
+        thread = threading.Thread(target=compute, daemon=True)
+        thread.start()
+    
+    
     
     def update_board_detection(
         self,
