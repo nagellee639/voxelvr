@@ -5,8 +5,6 @@ Provides graphical user interface components for VoxelVR.
 """
 
 from .app import VoxelVRApp
-from .unified_app import UnifiedVoxelVRApp
-from .unified_view import UnifiedView, CalibrationMode, TrackingMode
 from .camera_panel import CameraPanel, CameraFeedInfo
 from .calibration_panel import CalibrationPanel, CalibrationStep, CalibrationState
 from .tracking_panel import TrackingPanel, TrackingState, TrackerConfig
@@ -16,12 +14,8 @@ from .osc_status import OSCStatusIndicator, ConnectionState, OSCStats
 from .param_optimizer import ParameterOptimizer, FilterProfile, ProfileSettings, PROFILE_PRESETS
 
 __all__ = [
-    # Main applications
+    # Main application
     "VoxelVRApp",
-    "UnifiedVoxelVRApp",
-    "UnifiedView",
-    "CalibrationMode",
-    "TrackingMode",
     
     # Panels
     "CameraPanel",
@@ -46,4 +40,3 @@ __all__ = [
     "ProfileSettings",
     "PROFILE_PRESETS",
 ]
-

@@ -45,14 +45,15 @@ def synthesize_calibration(camera_ids: list[int]) -> tuple[list[CameraIntrinsics
     intrinsics = []
     extrinsics = []
     
-    # Arrange cameras in an arc around the origin at height 1.0m
+    # Arrange cameras in a circle around the origin (360 degrees)
     # Looking at (0, 1.0, 0)
     center = np.array([0.0, 1.0, 0.0])
-    radius = 2.0
+    radius = 2.5 # Room scale radius
     
     num_cams = len(camera_ids)
-    angle_step = np.pi / (num_cams + 1)
-    start_angle = -np.pi/2 + angle_step
+    # Distribute evenly around 360 degrees starting from -45 (corner)
+    angle_step = 2 * np.pi / num_cams
+    start_angle = -np.pi / 4 
     
     for i, cam_id in enumerate(camera_ids):
         # Intrinsic: simplified 720p

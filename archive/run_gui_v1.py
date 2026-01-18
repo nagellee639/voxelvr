@@ -26,7 +26,6 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from voxelvr.config import VoxelVRConfig, CameraConfig, MultiCameraCalibration
 from voxelvr.gui import VoxelVRApp
-from voxelvr.gui.unified_app import UnifiedVoxelVRApp
 from voxelvr.gui.performance_panel import PerformanceMetrics
 
 
@@ -286,16 +285,6 @@ def main():
         default=800,
         help="Window height"
     )
-    parser.add_argument(
-        "--unified", "-u",
-        action="store_true",
-        help="Use unified single-view interface (experimental)"
-    )
-    parser.add_argument(
-        "--record", "-r",
-        action="store_true",
-        help="Record time-synced video from all cameras (unified mode only)"
-    )
     
     args = parser.parse_args()
     
@@ -312,23 +301,11 @@ def main():
         calibration = MultiCameraCalibration.load(calibration_path)
     
     # Create application
-    if args.unified:
-        print("Starting unified interface...")
-        app = UnifiedVoxelVRApp(
-            title="VoxelVR - Unified Tracking",
-            width=args.width,
-            height=args.height,
-        )
-        
-        # Enable recording if requested
-        if args.record:
-            app.enable_recording()
-    else:
-        app = VoxelVRApp(
-            title="VoxelVR - Full Body Tracking",
-            width=args.width,
-            height=args.height,
-        )
+    app = VoxelVRApp(
+        title="VoxelVR - Full Body Tracking",
+        width=args.width,
+        height=args.height,
+    )
     
     # Setup tracking callbacks
     tracking_thread = None

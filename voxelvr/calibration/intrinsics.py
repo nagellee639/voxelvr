@@ -246,18 +246,35 @@ def calibrate_intrinsics(
         obj_points.append(current_obj_points)
         img_points.append(current_corners)
     
-    # Calibrate
-    ret, camera_matrix, dist_coeffs, rvecs, tvecs = cv2.calibrateCamera(
-        obj_points,
-        img_points,
-        image_size,
-        None,
-        None,
-        flags=cv2.CALIB_RATIONAL_MODEL,
-    )
+    # Validate data before calibration
+    min_frames_for_calibration = 5
+    valid_frames = sum(1 for pts in obj_points if len(pts) >= 4)
+    
+    if valid_frames < min_frames_for_calibration:
+        print(f"Error: Only {valid_frames} frames have enough corners. Need at least {min_frames_for_calibration}")
+        print("Try holding the board closer to the camera or with better lighting")
+        return None
+    
+    # Calibrate with try-except to catch OpenCV assertion failures
+    try:
+        ret, camera_matrix, dist_coeffs, rvecs, tvecs = cv2.calibrateCamera(
+            obj_points,
+            img_points,
+            image_size,
+            None,
+            None,
+            flags=cv2.CALIB_RATIONAL_MODEL,
+        )
+    except cv2.error as e:
+        print(f"OpenCV calibration error: {e}")
+        print("This usually means not enough corner variety. Try:")
+        print("  - Hold the board at more varied angles")
+        print("  - Ensure the entire board is visible")
+        print("  - Improve lighting conditions")
+        return None
     
     if not ret:
-        print("Calibration failed")
+        print("Calibration failed - optimization did not converge")
         return None
     
     print(f"Calibration successful! Reprojection error: {ret:.4f} pixels")
