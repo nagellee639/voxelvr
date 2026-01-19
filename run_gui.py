@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+import os
+os.environ["MPLBACKEND"] = "Agg"
 """
 VoxelVR GUI Application
 
@@ -42,6 +44,7 @@ def run_tracking_thread(app: VoxelVRApp, config: VoxelVRConfig, calibration: Mul
     from voxelvr.transport import OSCSender
     from voxelvr.transport.osc_sender import pose_to_trackers_with_rotations
     from voxelvr.transport.coordinate import create_default_transform, transform_pose_to_vrchat
+    from voxelvr.gui.skeleton_viewer import get_tpose
     from voxelvr.config import CameraIntrinsics, CameraExtrinsics
     import numpy as np
     
@@ -51,6 +54,11 @@ def run_tracking_thread(app: VoxelVRApp, config: VoxelVRConfig, calibration: Mul
     # Get configuration from GUI
     osc_ip, osc_port = app.tracking_panel.get_osc_config()
     enabled_trackers = app.tracking_panel.get_enabled_trackers()
+    
+    print(f"Debug: Initial enabled trackers: {enabled_trackers}")
+    if not enabled_trackers:
+        print("Warning: No trackers enabled! Forcing all enabled for debugging.")
+        enabled_trackers = ["hip", "chest", "left_foot", "right_foot", "left_knee", "right_knee", "left_elbow", "right_elbow"]
     
     # Setup camera manager
     camera_ids = list(calibration.cameras.keys())
@@ -65,8 +73,18 @@ def run_tracking_thread(app: VoxelVRApp, config: VoxelVRConfig, calibration: Mul
     
     try:
         print("Initializing camera manager...")
-        camera_manager = CameraManager(camera_configs)
-        camera_manager.load_calibration(calibration)
+        
+        # Check if app already has an active camera manager (UnifiedVoxelVRApp)
+        if hasattr(app, 'camera_manager') and app.camera_manager:
+            print("Using existing camera manager from app")
+            camera_manager = app.camera_manager
+            # Ensure it has the right calibration
+            camera_manager.load_calibration(calibration)
+        else:
+            # Create new manager (legacy/cli mode)
+            camera_manager = CameraManager(camera_configs)
+            camera_manager.load_calibration(calibration)
+        
         
         # Load pose detector
         print("Loading pose detector model...")
@@ -109,10 +127,14 @@ def run_tracking_thread(app: VoxelVRApp, config: VoxelVRConfig, calibration: Mul
         
         # OSC sender
         print("Connecting OSC...")
-        osc_sender = OSCSender(ip=osc_ip, port=osc_port, send_rate=60.0)
-        if not osc_sender.connect():
-            app.tracking_panel.on_tracking_error("Failed to connect OSC")
-            return
+        if hasattr(app, 'osc_sender') and app.osc_sender:
+             print("Using existing OSC sender from app")
+             osc_sender = app.osc_sender
+        else:
+             osc_sender = OSCSender(ip=osc_ip, port=osc_port, send_rate=60.0)
+             if not osc_sender.connect():
+                 app.tracking_panel.on_tracking_error("Failed to connect OSC")
+                 return
         
         # Configure enabled trackers
         for tracker_name in ['hip', 'chest', 'left_foot', 'right_foot', 
@@ -151,26 +173,48 @@ def run_tracking_thread(app: VoxelVRApp, config: VoxelVRConfig, calibration: Mul
             
             for cam_id, frame in frames.items():
                 kp = detector.detect(frame, camera_id=cam_id)
-                frame_to_show = frame.copy()
-                
                 if kp:
                     keypoints_2d[cam_id] = kp
-                    # Visualize detections
-                    frame_to_show = detector.draw_keypoints(frame_to_show, kp)
-                
-                # Update GUI with annotated frame
-                app.update_camera_frame(cam_id, frame_to_show)
-                
+            
+            # Send 2D detections to GUI for visualization (avoids double inference)
+            if hasattr(app, 'update_2d_detections'):
+                app.update_2d_detections(keypoints_2d)
+            
             detect_time = time.time() - detect_start
             
             # 3D triangulation
             triang_start = time.time()
             pose_3d = None
             
+            # Debug: Print detection status every 60 frames
+            if frame_count % 60 == 0:
+                det_status = [f"Cam{k}:{len(v.positions) if hasattr(v, 'positions') else 0}" for k,v in keypoints_2d.items()]
+                print(f"Debug [{frame_count}]: Detections in {len(keypoints_2d)} cams: {det_status}")
+            
             if len(keypoints_2d) >= 2:
                 kp_list = list(keypoints_2d.values())
-                pose_3d = triangulation.process(kp_list)
+                try:
+                    pose_3d = triangulation.process(kp_list)
+                    
+                    # Debug: Print triangulation result
+                    if frame_count % 60 == 0:
+                        if pose_3d:
+                            valid_cnt = np.sum(pose_3d['valid'])
+                            print(f"Debug [{frame_count}]: Triangulation produced {valid_cnt} valid joints")
+                        else:
+                             print(f"Debug [{frame_count}]: Triangulation returned None")
+                except Exception as e:
+                    print(f"Triangulation Error: {e}")
+            else:
+                 if frame_count % 60 == 0:
+                    print(f"Debug [{frame_count}]: Skipping triangulation - need 2+ cameras, have {len(keypoints_2d)}")
             
+            # Fallback for debug: T-Pose if no data
+            if pose_3d is None:
+                pose_3d = get_tpose()
+                if frame_count % 60 == 0:
+                    print(f"Debug [{frame_count}]: Using fallback T-Pose")
+
             triang_time = time.time() - triang_start
             
             # Apply temporal filter
@@ -208,6 +252,10 @@ def run_tracking_thread(app: VoxelVRApp, config: VoxelVRConfig, calibration: Mul
                 
                 # Filter to enabled trackers
                 trackers = {k: v for k, v in trackers.items() if k in enabled_trackers}
+                
+                # Debug OSC every 60 frames
+                if frame_count % 60 == 0:
+                     print(f"Debug [{frame_count}]: Sending {len(trackers)} trackers: {list(trackers.keys())}")
                 
                 # Send via OSC
                 if osc_sender.send_all_trackers(trackers):
@@ -257,10 +305,17 @@ def run_tracking_thread(app: VoxelVRApp, config: VoxelVRConfig, calibration: Mul
         app.tracking_panel.on_tracking_error(str(e))
     finally:
         # Cleanup
-        if 'camera_manager' in locals():
-            camera_manager.stop_all()
-        if 'osc_sender' in locals():
-            osc_sender.disconnect()
+        if 'camera_manager' in locals() and camera_manager:
+            # Only stop if it's NOT the shared app manager
+            is_shared = hasattr(app, 'camera_manager') and app.camera_manager is camera_manager
+            if not is_shared:
+                camera_manager.stop_all()
+            else:
+                print("Leaving shared camera manager running")
+        if 'osc_sender' in locals() and osc_sender:
+             # Only disconnect if we created it privately
+            if not (hasattr(app, 'osc_sender') and app.osc_sender is osc_sender):
+                osc_sender.disconnect()
         
         app.tracking_panel.on_tracking_stopped()
         app.osc_status.on_disconnect()
@@ -287,14 +342,14 @@ def main():
         help="Window height"
     )
     parser.add_argument(
-        "--unified", "-u",
+        "--legacy",
         action="store_true",
-        help="Use unified single-view interface (experimental)"
+        help="Use legacy multi-panel interface instead of unified view"
     )
     parser.add_argument(
         "--record", "-r",
         action="store_true",
-        help="Record time-synced video from all cameras (unified mode only)"
+        help="Record time-synced video from all cameras"
     )
     
     args = parser.parse_args()
@@ -311,8 +366,15 @@ def main():
         print(f"Loading calibration: {calibration_path}")
         calibration = MultiCameraCalibration.load(calibration_path)
     
-    # Create application
-    if args.unified:
+    # Create application (unified is now the default)
+    if args.legacy:
+        print("Starting legacy interface...")
+        app = VoxelVRApp(
+            title="VoxelVR - Full Body Tracking",
+            width=args.width,
+            height=args.height,
+        )
+    else:
         print("Starting unified interface...")
         app = UnifiedVoxelVRApp(
             title="VoxelVR - Unified Tracking",
@@ -323,25 +385,29 @@ def main():
         # Enable recording if requested
         if args.record:
             app.enable_recording()
-    else:
-        app = VoxelVRApp(
-            title="VoxelVR - Full Body Tracking",
-            width=args.width,
-            height=args.height,
-        )
     
     # Setup tracking callbacks
     tracking_thread = None
     
     def on_start_tracking():
-        nonlocal tracking_thread
-        if calibration is None:
-            app.tracking_panel.on_tracking_error("No calibration loaded")
+        nonlocal tracking_thread, calibration
+        
+        # For unified app, get calibration from the calibration panel
+        active_calibration = calibration
+        if hasattr(app, 'calibration_panel') and app.calibration_panel.state.extrinsics.result:
+            active_calibration = app.calibration_panel.state.extrinsics.result
+            print(f"Using computed calibration with {len(active_calibration.cameras)} cameras")
+        
+        if active_calibration is None:
+            print("Tracking error: No calibration loaded")
+            # For unified app, don't use tracking_panel (it doesn't exist)
+            if hasattr(app, 'tracking_panel'):
+                app.tracking_panel.on_tracking_error("No calibration loaded")
             return
         
         tracking_thread = threading.Thread(
             target=run_tracking_thread,
-            args=(app, config, calibration),
+            args=(app, config, active_calibration),
             daemon=True,
         )
         tracking_thread.start()

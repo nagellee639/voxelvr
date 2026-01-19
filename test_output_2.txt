@@ -1,0 +1,40 @@
+============================= test session starts ==============================
+platform linux -- Python 3.10.12, pytest-9.0.2, pluggy-1.6.0 -- /usr/bin/python3
+cachedir: .pytest_cache
+rootdir: /home/lee/voxelvr
+configfile: pytest.ini
+plugins: anyio-4.12.0, dash-3.3.0
+collecting ... collected 2 items
+
+tests/test_pipeline_integration.py::TestStartupTPose::test_app_starts_with_tpose_osc OSC client ready: 127.0.0.1:9000
+OSC connected
+Starting idle OSC loop...
+FAILED
+tests/test_pipeline_integration.py::TestPipelineDataFlow::test_pipeline_updates_pose OSC client ready: 127.0.0.1:9000
+OSC connected
+Starting idle OSC loop...
+FAILED
+
+=================================== FAILURES ===================================
+_______________ TestStartupTPose.test_app_starts_with_tpose_osc ________________
+tests/test_pipeline_integration.py:509: in test_app_starts_with_tpose_osc
+    assert len(calls) > 0, "Should have updated skeleton texture on init"
+E   AssertionError: Should have updated skeleton texture on init
+E   assert 0 > 0
+E    +  where 0 = len([])
+_______________ TestPipelineDataFlow.test_pipeline_updates_pose ________________
+tests/test_pipeline_integration.py:560: in test_pipeline_updates_pose
+    set_val_calls = mock_dpg.set_value.call_args_list
+E   NameError: name 'mock_dpg' is not defined
+=============================== warnings summary ===============================
+tests/test_pipeline_integration.py::TestStartupTPose::test_app_starts_with_tpose_osc
+  /home/lee/voxelvr/voxelvr/config.py:99: PydanticDeprecatedSince20: Support for class-based `config` is deprecated, use ConfigDict instead. Deprecated in Pydantic V2.0 to be removed in V3.0. See Pydantic V2 Migration Guide at https://errors.pydantic.dev/2.12/migration/
+    class VoxelVRConfig(BaseSettings):
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED tests/test_pipeline_integration.py::TestStartupTPose::test_app_starts_with_tpose_osc - AssertionError: Should have updated skeleton texture on init
+assert 0 > 0
+ +  where 0 = len([])
+FAILED tests/test_pipeline_integration.py::TestPipelineDataFlow::test_pipeline_updates_pose - NameError: name 'mock_dpg' is not defined
+========================= 2 failed, 1 warning in 1.31s =========================

@@ -49,6 +49,42 @@ JOINT_NAMES = [
 ]
 
 
+def get_tpose() -> dict:
+    """
+    Get a standard T-Pose for COCO 17-keypoint skeleton.
+    
+    Returns:
+        Dictionary with 'positions', 'confidences', and 'valid' mask.
+    """
+    positions = np.zeros((17, 3), dtype=np.float32)
+    # Hips (y=1.0)
+    positions[11] = [-0.1, 1.0, 0.0]
+    positions[12] = [ 0.1, 1.0, 0.0]
+    # Legs
+    positions[13] = [-0.1, 0.5, 0.0]
+    positions[14] = [ 0.1, 0.5, 0.0]
+    positions[15] = [-0.1, 0.0, 0.0]
+    positions[16] = [ 0.1, 0.0, 0.0]
+    # Torso (y=1.5)
+    positions[5] = [-0.2, 1.5, 0.0]
+    positions[6] = [ 0.2, 1.5, 0.0]
+    # Arms
+    positions[7] = [-0.45, 1.5, 0.0]
+    positions[8] = [ 0.45, 1.5, 0.0]
+    positions[9] = [-0.7, 1.5, 0.0]
+    positions[10] = [ 0.7, 1.5, 0.0]
+    # Head
+    positions[0] = [0.0, 1.6, 0.0]
+    positions[1] = [0.03, 1.65, 0.0]
+    positions[2] = [-0.03, 1.65, 0.0]
+    
+    return {
+        'positions': positions,
+        'confidences': np.ones(17, dtype=np.float32),
+        'valid': np.ones(17, dtype=bool)
+    }
+
+
 class SkeletonViewer:
     """3D skeleton visualization with automatic rotation."""
     
@@ -163,12 +199,20 @@ class SkeletonViewer:
         
         self.ax.clear()
         
+        # Convert Y-up (Unity/VoxelVR) to Z-up (Matplotlib) for visualization
+        # Input: (x, y, z) where Y is up
+        # Output: (x, z, y) where Z is up (mapped to Y input)
+        plot_points = np.zeros_like(keypoints_3d)
+        plot_points[:, 0] = keypoints_3d[:, 0]  # X -> X
+        plot_points[:, 1] = keypoints_3d[:, 2]  # Z -> Y (Depth)
+        plot_points[:, 2] = keypoints_3d[:, 1]  # Y -> Z (Up)
+        
         # Set view parameters
         self.ax.view_init(elev=self.elevation, azim=self.rotation_angle)
         
         # Plot joints
         if self.show_joints:
-            for i, (point, conf) in enumerate(zip(keypoints_3d, confidences)):
+            for i, (point, conf) in enumerate(zip(plot_points, confidences)):
                 if conf > 0.1:  # Only show if confident
                     color = self._confidence_to_color(conf)
                     self.ax.scatter(*point, c=[color], s=50, marker='o', edgecolors='black', linewidth=1)
@@ -177,7 +221,7 @@ class SkeletonViewer:
         if self.show_bones:
             for start_idx, end_idx in SKELETON_CONNECTIONS:
                 if confidences[start_idx] > 0.1 and confidences[end_idx] > 0.1:
-                    points = np.array([keypoints_3d[start_idx], keypoints_3d[end_idx]])
+                    points = np.array([plot_points[start_idx], plot_points[end_idx]])
                     
                     # Color based on average confidence
                     avg_conf = (confidences[start_idx] + confidences[end_idx]) / 2
@@ -198,8 +242,8 @@ class SkeletonViewer:
         # Set labels
         if self.show_axes:
             self.ax.set_xlabel('X (m)', fontsize=8)
-            self.ax.set_ylabel('Y (m)', fontsize=8)
-            self.ax.set_zlabel('Z (m)', fontsize=8)
+            self.ax.set_ylabel('Depth (m)', fontsize=8)
+            self.ax.set_zlabel('Height (m)', fontsize=8)
         else:
             self.ax.set_xlabel('')
             self.ax.set_ylabel('')
@@ -207,16 +251,24 @@ class SkeletonViewer:
         
         # Set equal aspect ratio and limits
         max_range = self.distance
-        center = keypoints_3d[confidences > 0.5].mean(axis=0) if np.any(confidences > 0.5) else np.zeros(3)
+        center = plot_points[confidences > 0.5].mean(axis=0) if np.any(confidences > 0.5) else np.zeros(3)
         
+        # For Z-up, we generally want Z to start at 0
         self.ax.set_xlim([center[0] - max_range/2, center[0] + max_range/2])
         self.ax.set_ylim([center[1] - max_range/2, center[1] + max_range/2])
         self.ax.set_zlim([0, max_range])
+        
+        # Force aspect ratio to be equal (cubic) so it doesn't look distorted
+        self.ax.set_box_aspect((1, 1, 1))
         
         # Update rotation
         if self.auto_rotate:
             self.rotation_angle = (self.rotation_angle + self.rotation_speed) % 360
         
+        # Update rotation
+        if self.auto_rotate:
+            self.rotation_angle = (self.rotation_angle + self.rotation_speed) % 360
+            
         # Render to image
         return self._fig_to_array()
     
@@ -251,7 +303,7 @@ class SkeletonViewer:
             RGBA array with shape (H, W, 4) and values 0-1
         """
         buf = BytesIO()
-        self.fig.savefig(buf, format='png', bbox_inches='tight', pad_inches=0.1, dpi=100)
+        self.fig.savefig(buf, format='png', dpi=100)
         buf.seek(0)
         img = Image.open(buf).convert('RGBA')
         
@@ -300,7 +352,12 @@ if __name__ == "__main__":
     # Render a few frames to test rotation
     for i in range(10):
         img = viewer.render_skeleton(keypoints, confidences)
-        print(f"Frame {i}: {img.shape}, range: [{img.min():.3f}, {img.max():.3f}]")
+        # Check if image is all white/transparent
+        non_zero = np.count_nonzero(img)
+        mean_val = np.mean(img)
+        print(f"Frame {i}: Shape {img.shape}, Range [{img.min():.3f}, {img.max():.3f}], Mean: {mean_val:.3f}, Non-zero: {non_zero}")
+        
+        # Simulate rotation
         time.sleep(0.1)
     
     viewer.close()

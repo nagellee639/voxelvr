@@ -131,6 +131,11 @@ def calibrate_camera_pair(
     
     T_a_to_b = create_transform_matrix(avg_rotation, avg_translation)
     
+    # Validate the transform - check for NaN, infinity, or unreasonable values
+    if not is_valid_transform(T_a_to_b, max_translation=10.0, max_rotation_angle=np.pi):
+        print(f"Pair ({cam_a}, {cam_b}): Invalid transform detected (NaN, Inf, or unreasonable values)")
+        return None
+    
     # Compute reprojection error (variance of transforms)
     errors = []
     for T in transforms:
@@ -141,6 +146,11 @@ def calibrate_camera_pair(
     
     avg_error = np.mean(errors)
     
+    # Validate the error - NaN or very high error indicates bad calibration
+    if np.isnan(avg_error) or avg_error > 5.0:
+        print(f"Pair ({cam_a}, {cam_b}): Bad error value ({avg_error:.2f}) - calibration rejected (threshold: 5.0)")
+        return None
+    
     return PairwiseCalibrationResult(
         camera_a=cam_a,
         camera_b=cam_b,
@@ -148,6 +158,46 @@ def calibrate_camera_pair(
         reprojection_error=avg_error,
         num_frames_used=len(transforms),
     )
+
+
+def is_valid_transform(T: np.ndarray, max_translation: float = 10.0, max_rotation_angle: float = np.pi) -> bool:
+    """
+    Validate a 4x4 transform matrix.
+    
+    Args:
+        T: 4x4 transformation matrix
+        max_translation: Maximum reasonable translation in meters
+        max_rotation_angle: Maximum rotation angle in radians (default pi = 180 degrees)
+        
+    Returns:
+        True if transform is valid and reasonable
+    """
+    if T is None:
+        return False
+    
+    # Check for NaN or Inf
+    if np.any(np.isnan(T)) or np.any(np.isinf(T)):
+        return False
+    
+    # Check translation magnitude
+    translation = T[:3, 3]
+    if np.linalg.norm(translation) > max_translation:
+        return False
+    
+    # Check rotation matrix is orthonormal
+    R = T[:3, :3]
+    if np.abs(np.linalg.det(R) - 1.0) > 0.1:  # Should be ~1 for rotation matrix
+        return False
+    
+    # Check rotation angle is reasonable
+    trace = np.trace(R)
+    if trace < -1 or trace > 3:
+        return False
+    angle = np.arccos(np.clip((trace - 1) / 2, -1, 1))
+    if angle > max_rotation_angle:
+        return False
+    
+    return True
 
 
 def chain_pairwise_transforms(

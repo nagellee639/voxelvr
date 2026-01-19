@@ -269,3 +269,68 @@ class TestUnifiedViewCalibrationPanel:
         
         # Both should reflect the same state
         assert unified_view.state.calibration.is_connected == progress['pairwise_connected']
+
+
+# ============================================================================
+# Intrinsic Retry Logic Tests  
+# ============================================================================
+
+class TestIntrinsicRetryLogic:
+    """Tests for intrinsic calibration failure recovery."""
+    
+    def test_handle_intrinsic_failure_first_attempt(self, panel_with_cameras):
+        """Test that first failure increments retry count and clears frames."""
+        panel_with_cameras.begin_calibration()
+        status = panel_with_cameras._state.cameras[0]
+        
+        # Initial state
+        initial_required = status.intrinsic_frames_required
+        
+        # Simulate having some captured frames
+        panel_with_cameras._intrinsic_frames[0] = [{'frame': None} for _ in range(15)]
+        
+        # Call failure handler
+        panel_with_cameras._handle_intrinsic_failure(0, status)
+        
+        # Verify retry behavior - frames cleared, required stays same
+        assert status.intrinsic_retry_count == 1
+        assert status.intrinsic_frames_required == initial_required  # No increase
+        assert status.intrinsic_frames_captured == 0  # Frames cleared
+    
+    def test_handle_intrinsic_failure_max_retries(self, panel_with_cameras):
+        """Test that 10th failure marks as final failure."""
+        panel_with_cameras.begin_calibration()
+        status = panel_with_cameras._state.cameras[0]
+        
+        # Simulate 9 prior failures
+        status.intrinsic_retry_count = 9
+        initial_required = status.intrinsic_frames_required
+        
+        # Call failure handler for 10th failure
+        panel_with_cameras._handle_intrinsic_failure(0, status)
+        
+        # Verify max retries reached and marked as failed
+        assert status.intrinsic_retry_count == 10
+        assert status.intrinsic_failed == True
+        # Required count should NOT increase after max retries
+        assert status.intrinsic_frames_required == initial_required
+    
+    def test_frames_cleared_on_failure(self, panel_with_cameras):
+        """Test that captured frames are cleared on calibration failure."""
+        panel_with_cameras.begin_calibration()
+        
+        # Simulate captured frames
+        mock_frames = [{'frame': f'frame_{i}', 'corners': None, 'ids': None} for i in range(20)]
+        panel_with_cameras._intrinsic_frames[0] = mock_frames
+        
+        status = panel_with_cameras._state.cameras[0]
+        initial_required = status.intrinsic_frames_required
+        
+        panel_with_cameras._handle_intrinsic_failure(0, status)
+        
+        # Frames should be cleared (not preserved)
+        assert len(panel_with_cameras._intrinsic_frames[0]) == 0
+        assert status.intrinsic_frames_captured == 0
+        # Required count should stay the same (not increase)
+        assert status.intrinsic_frames_required == initial_required
+

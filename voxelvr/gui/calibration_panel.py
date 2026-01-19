@@ -33,6 +33,8 @@ class CameraCalibrationStatus:
     intrinsic_result: Optional[Any] = None  # CameraIntrinsics when complete
     intrinsic_error: float = 0.0
     intrinsic_computing: bool = False
+    intrinsic_failed: bool = False  # True if failed after max retries
+    intrinsic_retry_count: int = 0  # Current retry count
     
     # Pairwise extrinsics (frames captured with each other camera)
     pairwise_frames: Dict[int, int] = field(default_factory=dict)
@@ -647,10 +649,13 @@ class CalibrationPanel:
                     status.intrinsic_error = result.reprojection_error
                     print(f"Camera {camera_id} intrinsics complete! Error: {result.reprojection_error:.3f}")
                 else:
-                    print(f"Camera {camera_id} intrinsics computation failed")
+                    # Calibration failed - keep frames for retry
+                    self._handle_intrinsic_failure(camera_id, status)
                 
             except Exception as e:
                 print(f"Error computing intrinsics for camera {camera_id}: {e}")
+                # Also handle exceptions with retry logic
+                self._handle_intrinsic_failure(camera_id, status)
             finally:
                 status.intrinsic_computing = False
                 self._notify_progress()
@@ -658,6 +663,32 @@ class CalibrationPanel:
         thread = threading.Thread(target=compute, daemon=True)
         self._computation_threads[camera_id] = thread
         thread.start()
+    
+    def _handle_intrinsic_failure(self, camera_id: int, status) -> None:
+        """Handle intrinsic calibration failure with retry logic.
+        
+        Completely resets the camera's captured frames on failure.
+        Bad images (blur, occlusion, poor angles) can block calibration,
+        so starting fresh is more reliable than keeping potentially bad frames.
+        """
+        status.intrinsic_retry_count += 1
+        old_frame_count = len(self._intrinsic_frames.get(camera_id, []))
+        
+        max_retries = 10
+        if status.intrinsic_retry_count < max_retries:
+            # Clear old frames - bad images may be blocking calibration
+            self._intrinsic_frames[camera_id] = []
+            status.intrinsic_frames_captured = 0
+            # Keep the same required count (don't increase)
+            
+            print(f"Camera {camera_id} intrinsics failed (attempt {status.intrinsic_retry_count}/{max_retries})")
+            print(f"  Cleared {old_frame_count} frames - starting fresh")
+            print(f"  Move the ChArUco board slowly at different angles...")
+        else:
+            # Max retries reached - mark as failed
+            status.intrinsic_failed = True
+            print(f"Camera {camera_id} intrinsics FAILED after {max_retries} attempts")
+            print(f"  Tips: improve lighting, avoid motion blur, ensure board is fully visible")
     
     def _check_and_trigger_pairwise_computation(self) -> None:
         """Check if we have enough pairwise data and trigger computation if ready."""
@@ -698,7 +729,7 @@ class CalibrationPanel:
     def _trigger_pairwise_extrinsic_computation(self) -> None:
         """Trigger background computation of pairwise extrinsic calibration."""
         import threading
-        from ..calibration.pairwise_extrinsics import calibrate_pairwise_extrinsics
+        from ..calibration.pairwise_extrinsics import calibrate_pairwise_extrinsics, is_valid_transform
         from ..config import CalibrationConfig
         
         self._state.extrinsics.computing = True
@@ -737,11 +768,31 @@ class CalibrationPanel:
                 )
                 
                 if result:
-                    self._state.extrinsics.complete = True
-                    self._state.extrinsics.result = result
-                    print("Pairwise extrinsics calibration complete!")
+                    # Validate all camera transforms
+                    bad_cameras = []
+                    for cam_id, cam_data in result.cameras.items():
+                        extr = cam_data.get('extrinsics', {})
+                        transform = extr.get('transform_matrix')
+                        if transform:
+                            import numpy as np
+                            T = np.array(transform)
+                            if not is_valid_transform(T):
+                                bad_cameras.append(cam_id)
+                    
+                    if bad_cameras:
+                        print(f"⚠ Cameras with bad transforms: {bad_cameras}")
+                        print("  Resetting pairwise captures for affected camera pairs...")
+                        self._reset_bad_pairs(bad_cameras)
+                        # Don't complete - need to recapture
+                        print("  Continue capturing with ChArUco board to fix calibration")
+                    else:
+                        self._state.extrinsics.complete = True
+                        self._state.extrinsics.result = result
+                        print("✓ Pairwise extrinsics calibration complete!")
                 else:
-                    print("Pairwise extrinsics calibration failed")
+                    print("✗ Pairwise extrinsics calibration failed - not enough valid pairs")
+                    print("  Resetting all pairwise captures for retry...")
+                    self._reset_all_pairwise_captures()
                 
             except Exception as e:
                 print(f"Error computing pairwise extrinsics: {e}")
@@ -753,6 +804,25 @@ class CalibrationPanel:
         
         thread = threading.Thread(target=compute, daemon=True)
         thread.start()
+    
+    def _reset_bad_pairs(self, bad_camera_ids: list) -> None:
+        """Reset pairwise captures for camera pairs involving bad cameras."""
+        pairs_to_reset = []
+        for (cam_a, cam_b) in self._pairwise_captures.keys():
+            if cam_a in bad_camera_ids or cam_b in bad_camera_ids:
+                pairs_to_reset.append((cam_a, cam_b))
+        
+        for pair in pairs_to_reset:
+            self._pairwise_captures[pair] = []
+            print(f"  Reset pair {pair}")
+        
+        self._notify_progress()
+    
+    def _reset_all_pairwise_captures(self) -> None:
+        """Reset all pairwise captures for a fresh start."""
+        for pair in self._pairwise_captures.keys():
+            self._pairwise_captures[pair] = []
+        self._notify_progress()
     
     def _trigger_extrinsic_computation(self) -> None:
         """Trigger background computation of overall extrinsic calibration (legacy - all cameras)."""

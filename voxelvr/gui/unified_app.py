@@ -20,7 +20,8 @@ from .unified_view import (
 )
 from .performance_panel import PerformancePanel, PerformanceMetrics
 from .debug_panel import DebugPanel
-from .skeleton_viewer import SkeletonViewer
+from .skeleton_viewer import SkeletonViewer, get_tpose
+from ..transport.osc_sender import OSCSender
 
 
 class UnifiedVoxelVRApp:
@@ -75,6 +76,13 @@ class UnifiedVoxelVRApp:
         self.camera_manager: Optional[CameraManager] = None
         self.preview_thread: Optional[threading.Thread] = None
         self.preview_active = False
+
+        # OSC Sender (Owner)
+        self.osc_sender = OSCSender(ip="127.0.0.1", port=9000)
+        
+        # Idle OSC Loop
+        self._idle_osc_thread: Optional[threading.Thread] = None
+        
         
         # Recording support
         self._recording_enabled = False
@@ -84,6 +92,30 @@ class UnifiedVoxelVRApp:
         # External callbacks
         self._on_start_tracking: Optional[Callable] = None
         self._on_stop_tracking: Optional[Callable] = None
+        
+        # Camera scaling
+        self._camera_scale = 1.0  # 0.5 = small, 1.0 = default, 2.0 = large
+        self._base_camera_size = (360, 270)  # Base size at scale 1.0
+        
+        # Tracker preset settings
+        self._tracker_preset = "full_body"  # full_body, upper_body, lower_body, legs_waist, custom
+        self._enabled_joints = set(range(17))  # All joints enabled by default
+        
+        # COCO joint names for UI
+        self._joint_names = [
+            "Nose", "L.Eye", "R.Eye", "L.Ear", "R.Ear",
+            "L.Shoulder", "R.Shoulder", "L.Elbow", "R.Elbow",
+            "L.Wrist", "R.Wrist", "L.Hip", "R.Hip",
+            "L.Knee", "R.Knee", "L.Ankle", "R.Ankle"
+        ]
+        
+        # Tracker presets
+        self._tracker_presets = {
+            "full_body": set(range(17)),
+            "upper_body": {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10},  # Head + arms
+            "lower_body": {5, 6, 11, 12, 13, 14, 15, 16},  # Shoulders + legs
+            "legs_waist": {11, 12, 13, 14, 15, 16},  # Hips + legs only
+        }
         
         # Connect view callbacks
         self._setup_callbacks()
@@ -114,6 +146,14 @@ class UnifiedVoxelVRApp:
         dpg.create_context()
         dpg.create_viewport(title=self.title, width=self.width, height=self.height)
         
+        # Connect OSC
+        self.osc_sender.connect()
+        self.osc_status.on_connect()
+        
+        # Start idle OSC loop
+        self._idle_osc_thread = threading.Thread(target=self._idle_osc_loop, daemon=True)
+        self._idle_osc_thread.start()
+        
         # Texture registry
         self._texture_registry = dpg.add_texture_registry()
         
@@ -127,6 +167,11 @@ class UnifiedVoxelVRApp:
             parent=self._texture_registry,
             tag="skeleton_texture"
         )
+        
+        # Initialize viewer with T-Pose
+        tpose = get_tpose()
+        self._current_pose = tpose # Store for OSC loop
+        self.update_skeleton_view(tpose['positions'], tpose['valid'])
         
         self._setup_theme()
         self._create_main_window()
@@ -205,6 +250,22 @@ class UnifiedVoxelVRApp:
                             callback=self._on_detect_cameras_click,
                         )
                         dpg.add_text("", tag="camera_count")
+                        
+                        dpg.add_spacer(width=20)
+                        
+                        # Zoom controls
+                        dpg.add_button(label="−", callback=self._on_zoom_out, width=30)
+                        dpg.add_button(label="+", callback=self._on_zoom_in, width=30)
+                        dpg.add_button(label="⊡ Fit", callback=self._on_autofit)
+                        dpg.add_text("100%", tag="zoom_label")
+                        
+                        dpg.add_spacer(width=20)
+                        
+                        # Tracker settings button
+                        dpg.add_button(
+                            label="🎮 Trackers",
+                            callback=self._toggle_tracker_window,
+                        )
                     
                     dpg.add_separator()
                     
@@ -389,6 +450,72 @@ class UnifiedVoxelVRApp:
                 with dpg.group():
                     dpg.add_text("Jitter")
                     dpg.add_text("-- mm", tag="perf_jitter", color=(100, 200, 100))
+        
+        # Tracker settings window
+        with dpg.window(
+            label="Tracker Settings",
+            tag="tracker_window",
+            width=350,
+            height=400,
+            pos=(200, 150),
+            show=False,
+        ):
+            dpg.add_text("Tracker Preset", color=(150, 200, 255))
+            dpg.add_separator()
+            
+            # Preset buttons
+            with dpg.group(horizontal=True):
+                dpg.add_button(label="Full Body", callback=lambda: self._apply_tracker_preset("full_body"))
+                dpg.add_button(label="Upper", callback=lambda: self._apply_tracker_preset("upper_body"))
+                dpg.add_button(label="Lower", callback=lambda: self._apply_tracker_preset("lower_body"))
+                dpg.add_button(label="Legs+Waist", callback=lambda: self._apply_tracker_preset("legs_waist"))
+            
+            dpg.add_spacer(height=10)
+            dpg.add_text("Current:", color=(120, 120, 120))
+            dpg.add_text("Full Body", tag="current_preset", color=(100, 200, 100))
+            
+            dpg.add_separator()
+            dpg.add_text("Custom Joint Selection", color=(150, 200, 255))
+            dpg.add_separator()
+            
+            # Joint checkboxes in a grid layout
+            # Head row
+            with dpg.group(horizontal=True):
+                dpg.add_checkbox(label="Nose", tag="joint_0", default_value=True, callback=self._on_joint_toggle)
+                dpg.add_checkbox(label="L.Eye", tag="joint_1", default_value=True, callback=self._on_joint_toggle)
+                dpg.add_checkbox(label="R.Eye", tag="joint_2", default_value=True, callback=self._on_joint_toggle)
+            with dpg.group(horizontal=True):
+                dpg.add_checkbox(label="L.Ear", tag="joint_3", default_value=True, callback=self._on_joint_toggle)
+                dpg.add_checkbox(label="R.Ear", tag="joint_4", default_value=True, callback=self._on_joint_toggle)
+            
+            dpg.add_spacer(height=5)
+            
+            # Arms row
+            with dpg.group(horizontal=True):
+                dpg.add_checkbox(label="L.Shoulder", tag="joint_5", default_value=True, callback=self._on_joint_toggle)
+                dpg.add_checkbox(label="R.Shoulder", tag="joint_6", default_value=True, callback=self._on_joint_toggle)
+            with dpg.group(horizontal=True):
+                dpg.add_checkbox(label="L.Elbow", tag="joint_7", default_value=True, callback=self._on_joint_toggle)
+                dpg.add_checkbox(label="R.Elbow", tag="joint_8", default_value=True, callback=self._on_joint_toggle)
+            with dpg.group(horizontal=True):
+                dpg.add_checkbox(label="L.Wrist", tag="joint_9", default_value=True, callback=self._on_joint_toggle)
+                dpg.add_checkbox(label="R.Wrist", tag="joint_10", default_value=True, callback=self._on_joint_toggle)
+            
+            dpg.add_spacer(height=5)
+            
+            # Legs row
+            with dpg.group(horizontal=True):
+                dpg.add_checkbox(label="L.Hip", tag="joint_11", default_value=True, callback=self._on_joint_toggle)
+                dpg.add_checkbox(label="R.Hip", tag="joint_12", default_value=True, callback=self._on_joint_toggle)
+            with dpg.group(horizontal=True):
+                dpg.add_checkbox(label="L.Knee", tag="joint_13", default_value=True, callback=self._on_joint_toggle)
+                dpg.add_checkbox(label="R.Knee", tag="joint_14", default_value=True, callback=self._on_joint_toggle)
+            with dpg.group(horizontal=True):
+                dpg.add_checkbox(label="L.Ankle", tag="joint_15", default_value=True, callback=self._on_joint_toggle)
+                dpg.add_checkbox(label="R.Ankle", tag="joint_16", default_value=True, callback=self._on_joint_toggle)
+            
+            dpg.add_separator()
+            dpg.add_text("", tag="joints_enabled_count", color=(120, 120, 120))
     
     # =========================================================================
     # Camera operations
@@ -420,7 +547,7 @@ class UnifiedVoxelVRApp:
             dpg.set_value("camera_count", "No cameras found")
     
     def _update_camera_grid(self, camera_ids: List[int]) -> None:
-        """Update camera grid display."""
+        """Update camera grid display with proper row/column layout."""
         dpg.delete_item("camera_grid", children_only=True)
         
         if not camera_ids:
@@ -428,28 +555,52 @@ class UnifiedVoxelVRApp:
             return
         
         rows, cols = self.view.get_camera_grid_layout()
+        scaled_w, scaled_h = self._get_scaled_camera_size()
         
-        for i, cam_id in enumerate(camera_ids):
-            # Create texture for this camera
+        # Create textures first (recreate if size changed)
+        for cam_id in camera_ids:
             texture_tag = f"cam_texture_{cam_id}"
             
-            if texture_tag not in self._camera_textures:
-                # Create placeholder texture
-                placeholder = np.zeros((360, 480, 4), dtype=np.float32)
-                placeholder[:, :, 3] = 1.0
-                
-                self._camera_textures[cam_id] = dpg.add_dynamic_texture(
-                    width=480,
-                    height=360,
-                    default_value=placeholder.flatten().tolist(),
-                    parent=self._texture_registry,
-                    tag=texture_tag,
-                )
+            # Delete old texture if exists (size may have changed)
+            if dpg.does_item_exist(texture_tag):
+                dpg.delete_item(texture_tag)
+                if cam_id in self._camera_textures:
+                    del self._camera_textures[cam_id]
             
-            # Add image to grid
-            with dpg.group(parent="camera_grid"):
-                dpg.add_text(f"Camera {cam_id}")
-                dpg.add_image(texture_tag)
+            # Create placeholder texture with scaled size
+            placeholder = np.zeros((scaled_h, scaled_w, 4), dtype=np.float32)
+            placeholder[:, :, 3] = 1.0
+            
+            self._camera_textures[cam_id] = dpg.add_dynamic_texture(
+                width=scaled_w,
+                height=scaled_h,
+                default_value=placeholder.flatten().tolist(),
+                parent=self._texture_registry,
+                tag=texture_tag,
+            )
+        
+        # Arrange cameras in grid
+        cam_idx = 0
+        for row in range(rows):
+            # Create horizontal group for each row
+            with dpg.group(horizontal=True, parent="camera_grid"):
+                for col in range(cols):
+                    if cam_idx >= len(camera_ids):
+                        break
+                    
+                    cam_id = camera_ids[cam_idx]
+                    texture_tag = f"cam_texture_{cam_id}"
+                    
+                    # Camera cell with label and image
+                    with dpg.group():
+                        dpg.add_text(f"Camera {cam_id}")
+                        dpg.add_image(texture_tag)
+                    
+                    # Spacer between cameras in row (except last)
+                    if col < cols - 1 and cam_idx < len(camera_ids) - 1:
+                        dpg.add_spacer(width=10)
+                    
+                    cam_idx += 1
     
     def update_camera_frame(self, camera_id: int, frame: np.ndarray) -> None:
         """Update a camera's texture with new frame."""
@@ -458,8 +609,9 @@ class UnifiedVoxelVRApp:
         if not dpg.does_item_exist(texture_tag):
             return
         
-        # Resize and convert
-        frame_resized = cv2.resize(frame, (480, 360))
+        # Resize to scaled grid cell size (4:3 aspect ratio)
+        scaled_w, scaled_h = self._get_scaled_camera_size()
+        frame_resized = cv2.resize(frame, (scaled_w, scaled_h))
         frame_rgba = cv2.cvtColor(frame_resized, cv2.COLOR_BGR2RGBA)
         frame_float = frame_rgba.astype(np.float32) / 255.0
         
@@ -495,9 +647,18 @@ class UnifiedVoxelVRApp:
             self.camera_manager.stop_all()
             self.camera_manager = None
     
+    def update_2d_detections(self, detections: Dict[int, object]) -> None:
+        """Update the latest 2D detections for visualization without re-inference."""
+        self._latest_detections = detections
+
     def _preview_loop(self) -> None:
-        """Camera preview update loop with ChArUco detection."""
+        """Camera preview update loop with ChArUco detection and 2D pose overlay."""
         from ..calibration.charuco import detect_charuco
+        from ..pose.detector_2d import PoseDetector2D
+        
+        # Lazy-load pose detector for 2D overlay (only used when NOT tracking externally)
+        pose_detector = None
+        self._latest_detections = {}
         
         while self.preview_active and dpg.is_dearpygui_running():
             if not self.camera_manager:
@@ -507,10 +668,13 @@ class UnifiedVoxelVRApp:
             
             if frames:
                 detections = {}
+                is_tracking = self.view.state.tracking_mode in (TrackingMode.RUNNING, TrackingMode.STARTING)
                 
                 for cam_id, frame in frames.items():
-                    # Detect ChArUco board
-                    result = detect_charuco(frame.image, self._charuco_board, self._aruco_dict)
+                    display_frame = frame.image.copy()
+                    
+                    # Always detect ChArUco for calibration
+                    result = detect_charuco(display_frame, self._charuco_board, self._aruco_dict)
                     detections[cam_id] = {
                         'success': result['success'],
                         'corners': result['corners'],
@@ -518,8 +682,36 @@ class UnifiedVoxelVRApp:
                         'frame': frame.image
                     }
                     
-                    # Use annotated frame for display
+                    # Use ChArUco annotated frame
                     display_frame = result['image_with_markers']
+                    
+                    # If tracking, draw 2D pose using available data
+                    if is_tracking:
+                        pose_result = None
+                        
+                        # Case 1: Use externally provided detections (optimized)
+                        if cam_id in self._latest_detections:
+                            pose_result = self._latest_detections[cam_id]
+                            
+                        # Case 2: Run local inference (fallback, e.g. standalone mode)
+                        # Only if we haven't received external updates recently?
+                        # For now, if we are in unified app mode with tracking thread running, 
+                        # we rely on update_2d_detections.
+                        elif pose_detector is None:
+                             # Wait for tracking thread to provide data to avoid double GPU usage
+                             pass
+                             
+                        if pose_result and hasattr(pose_result, 'positions'):
+                            # Draw 2D skeleton on frame
+                            display_frame = self._draw_2d_skeleton(display_frame, pose_result)
+                            
+                            # Add detection indicator
+                            valid_joints = int(np.sum(pose_result.confidences > 0.3))
+                            self._draw_detection_indicator(display_frame, valid_joints)
+                        else:
+                            # Show indicator even when no detection
+                            self._draw_detection_indicator(display_frame, 0)
+                    
                     self.update_camera_frame(cam_id, display_frame)
                     
                     # Update camera visibility in view state
@@ -528,7 +720,7 @@ class UnifiedVoxelVRApp:
                         board_visible=result['success']
                     )
                 
-                # Process detections for calibration (always active in unified mode)
+                # Process detections for calibration (when in calibration step)
                 capture_result = self.calibration_panel.process_frame_detections(detections)
                 
                 # Handle recording if enabled
@@ -536,6 +728,70 @@ class UnifiedVoxelVRApp:
                     self._record_frames(frames)
             
             time.sleep(0.033)  # ~30 FPS
+    
+    def _draw_2d_skeleton(self, frame: np.ndarray, pose_result) -> np.ndarray:
+        """Draw 2D skeleton overlay on frame."""
+        # COCO skeleton connections
+        connections = [
+            (0, 1), (0, 2), (1, 3), (2, 4),  # Head
+            (5, 6),  # Shoulders
+            (5, 7), (7, 9),  # Left arm
+            (6, 8), (8, 10),  # Right arm
+            (5, 11), (6, 12),  # Torso
+            (11, 12),  # Hips
+            (11, 13), (13, 15),  # Left leg
+            (12, 14), (14, 16),  # Right leg
+        ]
+        
+        output = frame.copy()
+        positions = pose_result.positions  # (17, 2)
+        confidences = pose_result.confidences  # (17,)
+        
+        # Draw connections
+        for i, j in connections:
+            if confidences[i] > 0.3 and confidences[j] > 0.3:
+                pt1 = tuple(map(int, positions[i]))
+                pt2 = tuple(map(int, positions[j]))
+                cv2.line(output, pt1, pt2, (0, 255, 0), 2)
+        
+        # Draw keypoints
+        for i, (pt, conf) in enumerate(zip(positions, confidences)):
+            if conf > 0.3:
+                center = tuple(map(int, pt))
+                color = (0, 255, 255) if conf > 0.5 else (0, 165, 255)
+                cv2.circle(output, center, 4, color, -1)
+        
+        return output
+    
+    def _draw_detection_indicator(self, frame: np.ndarray, valid_joints: int) -> None:
+        """Draw detection quality indicator on frame (in-place)."""
+        # Determine color based on joint count
+        if valid_joints >= 12:
+            color = (0, 200, 0)  # Green - good detection
+            status = "GOOD"
+        elif valid_joints >= 6:
+            color = (0, 200, 200)  # Yellow - partial detection  
+            status = "PARTIAL"
+        elif valid_joints > 0:
+            color = (0, 100, 200)  # Orange - weak detection
+            status = "WEAK"
+        else:
+            color = (0, 0, 180)  # Red - no detection
+            status = "NONE"
+        
+        # Draw indicator box in top-left corner
+        text = f"Joints: {valid_joints}/17 ({status})"
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 0.5
+        thickness = 1
+        (text_w, text_h), baseline = cv2.getTextSize(text, font, font_scale, thickness)
+        
+        # Background box
+        cv2.rectangle(frame, (5, 5), (text_w + 15, text_h + baseline + 15), (0, 0, 0), -1)
+        cv2.rectangle(frame, (5, 5), (text_w + 15, text_h + baseline + 15), color, 2)
+        
+        # Text
+        cv2.putText(frame, text, (10, text_h + 10), font, font_scale, color, thickness)
     
     # =========================================================================
     # Calibration callbacks
@@ -578,12 +834,34 @@ class UnifiedVoxelVRApp:
         """Update the pairwise progress grid display."""
         progress = self.calibration_panel.get_progress_summary()
         
-        # Update per-camera intrinsic bars
+        # Update per-camera intrinsic bars with state colors
         for cam_id, data in progress['cameras'].items():
             tag = f"intrinsic_{cam_id}"
+            label_tag = f"intrinsic_label_{cam_id}"
+            
             if dpg.does_item_exist(tag):
                 percent = data['intrinsic_percent'] / 100.0
                 dpg.set_value(tag, percent)
+                
+                # Get status from calibration panel state
+                status = self.calibration_panel._state.cameras.get(cam_id)
+                if status:
+                    if status.intrinsic_failed:
+                        # Red for failed
+                        dpg.configure_item(tag, overlay="FAILED")
+                    elif status.intrinsic_computing:
+                        # Show computing with retry count
+                        if status.intrinsic_retry_count > 0:
+                            dpg.configure_item(tag, overlay=f"Retry {status.intrinsic_retry_count}")
+                        else:
+                            dpg.configure_item(tag, overlay="...")
+                    elif status.intrinsic_complete:
+                        dpg.configure_item(tag, overlay="OK")
+                    elif status.intrinsic_retry_count > 0:
+                        # Between retries - show retry count
+                        dpg.configure_item(tag, overlay=f"#{status.intrinsic_retry_count}")
+                    else:
+                        dpg.configure_item(tag, overlay="")
         
         # Update pairwise bars
         for pair, data in progress['pairwise'].items():
@@ -702,13 +980,30 @@ class UnifiedVoxelVRApp:
     
     def _on_tracking_toggle(self, sender, app_data) -> None:
         """Handle tracking start/stop toggle."""
-        if self.view.state.tracking_mode == TrackingMode.RUNNING:
-            self.view.stop_tracking()
+        current_mode = self.view.state.tracking_mode
+        
+        if current_mode in (TrackingMode.RUNNING, TrackingMode.STARTING):
+            # Stop tracking
+            self.view.state.tracking_mode = TrackingMode.STOPPED
+            self.view._notify_state_change()
             dpg.set_item_label("tracking_btn", "▶ Start Tracking")
+            print("Tracking stopped")
+            if self._on_stop_tracking:
+                self._on_stop_tracking()
         else:
-            self._stop_preview()
-            self.view.start_tracking()
+            # Start tracking - go directly to RUNNING for immediate feedback
+            self.view.state.tracking_mode = TrackingMode.RUNNING
+            self.view._notify_state_change()
             dpg.set_item_label("tracking_btn", "⏹ Stop Tracking")
+            
+            # Show warning if not calibrated
+            if not self.view.state.calibration.is_calibrated:
+                print("⚠ WARNING: Tracking started without calibration - skeleton overlay visible for debugging")
+            else:
+                print("Tracking started")
+            
+            if self._on_start_tracking:
+                self._on_start_tracking()
     
     def _on_tracking_start(self) -> None:
         """Called when tracking starts."""
@@ -739,6 +1034,14 @@ class UnifiedVoxelVRApp:
         ip = dpg.get_value("osc_ip_input")
         port = dpg.get_value("osc_port_input")
         self.view.set_osc_config(ip, port)
+        
+        # Update actual sender
+        if self.osc_sender:
+            self.osc_sender.disconnect()
+            self.osc_sender.ip = ip
+            self.osc_sender.port = port
+            self.osc_sender.connect()
+            print(f"OSC configuration updated: {ip}:{port}")
     
     # =========================================================================
     # Floating windows
@@ -753,6 +1056,124 @@ class UnifiedVoxelVRApp:
         """Toggle performance window visibility."""
         self.view.toggle_performance_window()
         dpg.configure_item("perf_window", show=self.view.state.performance_window_open)
+    
+    def _toggle_tracker_window(self, sender=None, app_data=None) -> None:
+        """Toggle tracker settings window visibility."""
+        is_visible = dpg.is_item_shown("tracker_window")
+        dpg.configure_item("tracker_window", show=not is_visible)
+        self._update_joints_count_label()
+    
+    # =========================================================================
+    # Zoom controls
+    # =========================================================================
+    
+    def _on_zoom_in(self, sender=None, app_data=None) -> None:
+        """Zoom in on camera grid."""
+        self._camera_scale = min(2.0, self._camera_scale + 0.25)
+        self._apply_camera_scale()
+    
+    def _on_zoom_out(self, sender=None, app_data=None) -> None:
+        """Zoom out on camera grid."""
+        self._camera_scale = max(0.25, self._camera_scale - 0.25)
+        self._apply_camera_scale()
+    
+    def _on_autofit(self, sender=None, app_data=None) -> None:
+        """Auto-fit cameras to available space."""
+        n_cameras = len(self.view.state.cameras)
+        if n_cameras == 0:
+            return
+        
+        # Get available space (camera_grid panel)
+        available_width = 880  # Approximate usable width
+        available_height = 480  # Approximate usable height
+        
+        rows, cols = self.view.get_camera_grid_layout()
+        
+        # Calculate max size per camera with margins
+        margin = 15
+        max_width = (available_width - margin * (cols + 1)) // cols
+        max_height = (available_height - margin * (rows + 1)) // rows
+        
+        # Maintain 4:3 aspect ratio
+        base_w, base_h = self._base_camera_size
+        scale_w = max_width / base_w
+        scale_h = max_height / base_h
+        
+        self._camera_scale = min(scale_w, scale_h, 2.0)
+        self._camera_scale = max(0.25, self._camera_scale)
+        self._apply_camera_scale()
+    
+    def _apply_camera_scale(self) -> None:
+        """Apply current camera scale to grid."""
+        percentage = int(self._camera_scale * 100)
+        if dpg.does_item_exist("zoom_label"):
+            dpg.set_value("zoom_label", f"{percentage}%")
+        
+        # Rebuild camera grid with new size
+        camera_ids = list(self.view.state.cameras.keys())
+        if camera_ids:
+            self._update_camera_grid(camera_ids)
+    
+    def _get_scaled_camera_size(self) -> tuple:
+        """Get camera display size based on current scale."""
+        base_w, base_h = self._base_camera_size
+        return (int(base_w * self._camera_scale), int(base_h * self._camera_scale))
+    
+    # =========================================================================
+    # Tracker preset controls
+    # =========================================================================
+    
+    def _apply_tracker_preset(self, preset_name: str) -> None:
+        """Apply a tracker preset."""
+        if preset_name in self._tracker_presets:
+            self._enabled_joints = self._tracker_presets[preset_name].copy()
+            self._tracker_preset = preset_name
+            
+            # Update checkboxes
+            for i in range(17):
+                tag = f"joint_{i}"
+                if dpg.does_item_exist(tag):
+                    dpg.set_value(tag, i in self._enabled_joints)
+            
+            # Update preset label
+            preset_labels = {
+                "full_body": "Full Body",
+                "upper_body": "Upper Body",
+                "lower_body": "Lower Body",
+                "legs_waist": "Legs + Waist",
+            }
+            if dpg.does_item_exist("current_preset"):
+                dpg.set_value("current_preset", preset_labels.get(preset_name, "Custom"))
+            
+            self._update_joints_count_label()
+            print(f"Applied tracker preset: {preset_name} ({len(self._enabled_joints)} joints)")
+    
+    def _on_joint_toggle(self, sender, app_data) -> None:
+        """Handle individual joint checkbox toggle."""
+        # Extract joint index from sender tag (e.g., "joint_5" -> 5)
+        tag = dpg.get_item_alias(sender) if dpg.get_item_alias(sender) else str(sender)
+        if tag.startswith("joint_"):
+            try:
+                joint_idx = int(tag.split("_")[1])
+                if app_data:
+                    self._enabled_joints.add(joint_idx)
+                else:
+                    self._enabled_joints.discard(joint_idx)
+                
+                # Update to custom mode
+                self._tracker_preset = "custom"
+                if dpg.does_item_exist("current_preset"):
+                    dpg.set_value("current_preset", "Custom")
+                
+                self._update_joints_count_label()
+            except (ValueError, IndexError):
+                pass
+    
+    def _update_joints_count_label(self) -> None:
+        """Update the joints enabled count label."""
+        if dpg.does_item_exist("joints_enabled_count"):
+            count = len(self._enabled_joints)
+            dpg.set_value("joints_enabled_count", f"{count}/17 joints enabled")
     
     # =========================================================================
     # Update methods
@@ -780,9 +1201,9 @@ class UnifiedVoxelVRApp:
         if self._skeleton_texture is None:
             return
         
-        frame = self.skeleton_viewer.render(positions, valid)
-        frame_float = frame.astype(np.float32) / 255.0
-        dpg.set_value("skeleton_texture", frame_float.flatten().tolist())
+        frame = self.skeleton_viewer.render_skeleton(positions, valid)
+        # frame is already float32 range [0, 1]
+        dpg.set_value("skeleton_texture", frame.flatten().tolist())
     
     # =========================================================================
     # Compatibility shims for run_gui.py
@@ -794,7 +1215,7 @@ class UnifiedVoxelVRApp:
         return self._TrackingPanelShim(self)
     
     class _TrackingPanelShim:
-        """Minimal shim to provide tracking_panel interface."""
+        """Minimal shim to provide tracking_panel interface for run_gui.py compatibility."""
         def __init__(self, app: 'UnifiedVoxelVRApp'):
             self.app = app
         
@@ -802,9 +1223,63 @@ class UnifiedVoxelVRApp:
             """Handle tracking error."""
             print(f"Tracking error: {message}")
         
+        def on_tracking_started(self) -> None:
+            """Handle tracking started."""
+            print("Tracking started successfully")
+        
+        def on_tracking_stopped(self) -> None:
+            """Handle tracking stopped."""
+            print("Tracking stopped")
+        
+        def get_osc_config(self) -> tuple:
+            """Get OSC IP and port from the unified app's inputs."""
+            import dearpygui.dearpygui as dpg
+            ip = "127.0.0.1"
+            port = 9000
+            if dpg.does_item_exist("osc_ip_input"):
+                ip = dpg.get_value("osc_ip_input") or "127.0.0.1"
+            if dpg.does_item_exist("osc_port_input"):
+                port = dpg.get_value("osc_port_input") or 9000
+            return (ip, port)
+        
+        def get_enabled_trackers(self) -> list:
+            """Get list of enabled tracker names based on app's selected joints."""
+            # Map joint indices to VRChat tracker names
+            joint_to_tracker = {
+                0: 'head',
+                5: 'left_shoulder', 6: 'right_shoulder',
+                7: 'left_elbow', 8: 'right_elbow',
+                9: 'left_wrist', 10: 'right_wrist',
+                11: 'left_hip', 12: 'right_hip',
+                13: 'left_knee', 14: 'right_knee',
+                15: 'left_foot', 16: 'right_foot',
+            }
+            enabled = []
+            for joint_idx in self.app._enabled_joints:
+                if joint_idx in joint_to_tracker:
+                    enabled.append(joint_to_tracker[joint_idx])
+            # Always include core trackers for VRChat
+            core_trackers = ['hip', 'chest', 'left_foot', 'right_foot', 'left_knee', 'right_knee']
+            for t in core_trackers:
+                if t not in enabled:
+                    enabled.append(t)
+            return enabled
+        
+        def update_pose(self, positions, valid, confidences) -> None:
+            """Update pose display."""
+            self.app.update_skeleton_view(positions, valid)
+        
+        def update_status(self, fps: float, valid_joints: int, trackers_sending: int) -> None:
+            """Update tracking status display."""
+            pass
+        
         @property
         def is_running(self) -> bool:
             return self.app.view.state.tracking_mode == TrackingMode.RUNNING
+
+        def get_current_pose(self) -> Optional[Dict]:
+            """Get current pose from app state."""
+            return getattr(self.app, '_current_pose', None)
     
     @property 
     def state(self):
@@ -816,6 +1291,25 @@ class UnifiedVoxelVRApp:
         def __init__(self, app: 'UnifiedVoxelVRApp'):
             self.app = app
             self.is_running = True
+    
+    @property
+    def osc_status(self):
+        """Compatibility shim for OSC status."""
+        return self._OscStatusShim()
+    
+    class _OscStatusShim:
+        """Minimal shim for OSC status display."""
+        def on_connect(self) -> None:
+            print("OSC connected")
+        
+        def on_disconnect(self) -> None:
+            print("OSC disconnected")
+        
+        def on_message_sent(self) -> None:
+            pass  # Called frequently, don't log
+    
+    # Note: debug_panel is set in __init__ as a real DebugPanel instance
+    # No shim needed since the actual debug_panel works correctly
     
     # =========================================================================
     # Lifecycle
@@ -869,6 +1363,81 @@ class UnifiedVoxelVRApp:
             print(f"Saved {len(self._recording_timestamps)} frame timestamps")
             self._recording_timestamps.clear()
     
+    def _idle_osc_loop(self) -> None:
+        """
+        Background loop to send T-Pose (or last valid pose) when tracking is not running.
+        Also updates the local skeleton preview.
+        """
+        from ..transport.osc_sender import pose_to_trackers_with_rotations
+        from ..transport.coordinate import create_default_transform, transform_pose_to_vrchat, CoordinateTransform
+        
+        print("Starting idle OSC loop...")
+        # T-Pose is already in Y-Up (VRChat-like) coordinates, so we don't need to flip Y.
+        # Use identity rotation.
+        coord_transform = CoordinateTransform(rotation=np.eye(3))
+        
+        print(f"OSC Idle Loop: Target {self.osc_sender.ip}:{self.osc_sender.port}")
+        last_print = 0
+        
+        try:
+            while not self._stop_event.is_set():
+                # Check DPG status but don't exit loop immediately if false, just break if context destroyed
+                # if not dpg.is_dearpygui_running():
+                #      print("Idle OSC: DPG not running, exiting loop")
+                #      break
+                # ... (inner loop content)
+                # Only run if tracking is NOT running (main tracking loop handles it otherwise)
+                if self.view.state.tracking_mode not in (TrackingMode.RUNNING, TrackingMode.STARTING):
+                    try:
+                        # Get current pose from tracking panel (default is T-pose)
+                        current_pose = self.tracking_panel.get_current_pose()
+                        
+                        if current_pose is None:
+                            if time.time() - last_print > 5.0:
+                                 print("OSC Idle: No current pose available")
+                        else:
+                            positions = current_pose['positions']
+                            valid = current_pose['valid']
+                            confidences = current_pose['confidences']
+                            
+                            # 1. Update local skeleton view
+                            self.update_skeleton_view(positions, valid)
+                            
+                            # 2. Transform coordinates for VRChat
+                            transformed, _ = transform_pose_to_vrchat(
+                                positions,
+                                coord_transform,
+                            )
+                            
+                            # 3. Convert to VRChat trackers
+                            trackers = pose_to_trackers_with_rotations(
+                                transformed,
+                                confidences,
+                                valid,
+                            )
+                            
+                            # 4. Filter enabled trackers
+                            # Use the app's _enabled_joints to filter
+                            enabled_trackers = self.tracking_panel.get_enabled_trackers()
+                            trackers_filtered = {k: v for k, v in trackers.items() if k in enabled_trackers}
+                            
+                            # 5. Send OSC
+                            if self.osc_sender.send_all_trackers(trackers_filtered):
+                                if time.time() - last_print > 5.0:
+                                    print(f"OSC Idle: Sent T-Pose packet to {self.osc_sender.ip}:{self.osc_sender.port}")
+                                    last_print = time.time()
+                            
+                    except Exception as e:
+                        # Rate limit error printing
+                        if time.time() - last_print > 5.0:
+                            print(f"Idle OSC error: {e}")
+                else:
+                     pass
+                
+                time.sleep(0.033)  # ~30 FPS for smooth preview
+        except Exception as e:
+            print(f"CRITICAL: Idle OSC thread crashed: {e}")
+    
     def run(self) -> None:
         """Run the application main loop."""
         # Ensure setup is called
@@ -882,8 +1451,9 @@ class UnifiedVoxelVRApp:
             self._start_preview(cameras)
             self.calibration_panel.set_cameras(cameras)
             self._create_pairwise_grid(cameras)
+            # Start calibration capture phase (just sets step, doesn't compute yet)
             self.calibration_panel.begin_calibration()
-            print(f"Auto-detected {len(cameras)} camera(s), starting calibration")
+            print(f"Auto-detected {len(cameras)} camera(s), ready for calibration")
         
         while dpg.is_dearpygui_running():
             dpg.render_dearpygui_frame()
@@ -896,4 +1466,6 @@ class UnifiedVoxelVRApp:
         """Request application shutdown."""
         self._cleanup_recording()
         self._stop_event.set()
+        if self.osc_sender:
+            self.osc_sender.disconnect()
         dpg.stop_dearpygui()

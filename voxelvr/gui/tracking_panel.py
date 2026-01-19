@@ -99,9 +99,12 @@ class TrackingPanel:
         self._tracker_callbacks: List[Callable[[str, bool], None]] = []
         
         # Current pose data (for display)
-        self._current_positions: Optional[np.ndarray] = None
-        self._current_valid_mask: Optional[np.ndarray] = None
-        self._current_confidences: Optional[np.ndarray] = None
+        # Initialize with T-Pose
+        from .skeleton_viewer import get_tpose
+        tpose = get_tpose()
+        self._current_positions = tpose['positions']
+        self._current_valid_mask = tpose['valid']
+        self._current_confidences = tpose['confidences']
     
     @property
     def status(self) -> TrackingStatus:

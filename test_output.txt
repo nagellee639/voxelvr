@@ -1,0 +1,60 @@
+============================= test session starts ==============================
+platform linux -- Python 3.10.12, pytest-9.0.2, pluggy-1.6.0 -- /usr/bin/python3
+cachedir: .pytest_cache
+rootdir: /home/lee/voxelvr
+configfile: pytest.ini
+plugins: anyio-4.12.0, dash-3.3.0
+collecting ... collected 2 items
+
+tests/test_pipeline_integration.py::TestStartupTPose::test_app_starts_with_tpose_osc Fatal Python error: Segmentation fault
+
+Current thread 0x00007afb43fff640 (most recent call first):
+  File "/home/lee/.local/lib/python3.10/site-packages/dearpygui/dearpygui.py", line 8966 in is_dearpygui_running
+  File "/home/lee/voxelvr/voxelvr/gui/unified_app.py", line 1372 in _idle_osc_loop
+  File "/usr/lib/python3.10/threading.py", line 953 in run
+  File "/usr/lib/python3.10/threading.py", line 1016 in _bootstrap_inner
+  File "/usr/lib/python3.10/threading.py", line 973 in _bootstrap
+
+Thread 0x00007afb78731000 (most recent call first):
+  File "/usr/lib/python3.10/posixpath.py", line 428 in _joinrealpath
+  File "/usr/lib/python3.10/posixpath.py", line 393 in realpath
+  File "/usr/lib/python3.10/inspect.py", line 878 in getmodule
+  File "/usr/lib/python3.10/inspect.py", line 952 in findsource
+  File "/home/lee/.local/lib/python3.10/site-packages/_pytest/_code/source.py", line 127 in findsource
+  File "/home/lee/.local/lib/python3.10/site-packages/_pytest/_code/code.py", line 106 in fullsource
+  File "/home/lee/.local/lib/python3.10/site-packages/_pytest/_code/code.py", line 289 in getsource
+  File "/home/lee/.local/lib/python3.10/site-packages/_pytest/_code/code.py", line 901 in _getentrysource
+  File "/home/lee/.local/lib/python3.10/site-packages/_pytest/_code/code.py", line 1063 in repr_traceback_entry
+  File "/home/lee/.local/lib/python3.10/site-packages/_pytest/_code/code.py", line 1133 in <listcomp>
+  File "/home/lee/.local/lib/python3.10/site-packages/_pytest/_code/code.py", line 1132 in repr_traceback
+  File "/home/lee/.local/lib/python3.10/site-packages/_pytest/_code/code.py", line 1200 in repr_excinfo
+  File "/home/lee/.local/lib/python3.10/site-packages/_pytest/_code/code.py", line 765 in getrepr
+  File "/home/lee/.local/lib/python3.10/site-packages/_pytest/nodes.py", line 456 in _repr_failure_py
+  File "/home/lee/.local/lib/python3.10/site-packages/_pytest/python.py", line 1762 in repr_failure
+  File "/home/lee/.local/lib/python3.10/site-packages/_pytest/reports.py", line 263 in _format_failed_longrepr
+  File "/home/lee/.local/lib/python3.10/site-packages/_pytest/reports.py", line 438 in from_item_and_call
+  File "/home/lee/.local/lib/python3.10/site-packages/_pytest/runner.py", line 377 in pytest_runtest_makereport
+  File "/home/lee/.local/lib/python3.10/site-packages/pluggy/_callers.py", line 121 in _multicall
+  File "/home/lee/.local/lib/python3.10/site-packages/pluggy/_manager.py", line 120 in _hookexec
+  File "/home/lee/.local/lib/python3.10/site-packages/pluggy/_hooks.py", line 512 in __call__
+  File "/home/lee/.local/lib/python3.10/site-packages/_pytest/runner.py", line 249 in call_and_report
+  File "/home/lee/.local/lib/python3.10/site-packages/_pytest/runner.py", line 137 in runtestprotocol
+  File "/home/lee/.local/lib/python3.10/site-packages/_pytest/runner.py", line 118 in pytest_runtest_protocol
+  File "/home/lee/.local/lib/python3.10/site-packages/pluggy/_callers.py", line 121 in _multicall
+  File "/home/lee/.local/lib/python3.10/site-packages/pluggy/_manager.py", line 120 in _hookexec
+  File "/home/lee/.local/lib/python3.10/site-packages/pluggy/_hooks.py", line 512 in __call__
+  File "/home/lee/.local/lib/python3.10/site-packages/_pytest/main.py", line 396 in pytest_runtestloop
+  File "/home/lee/.local/lib/python3.10/site-packages/pluggy/_callers.py", line 121 in _multicall
+  File "/home/lee/.local/lib/python3.10/site-packages/pluggy/_manager.py", line 120 in _hookexec
+  File "/home/lee/.local/lib/python3.10/site-packages/pluggy/_hooks.py", line 512 in __call__
+  File "/home/lee/.local/lib/python3.10/site-packages/_pytest/main.py", line 372 in _main
+  File "/home/lee/.local/lib/python3.10/site-packages/_pytest/main.py", line 318 in wrap_session
+  File "/home/lee/.local/lib/python3.10/site-packages/_pytest/main.py", line 365 in pytest_cmdline_main
+  File "/home/lee/.local/lib/python3.10/site-packages/pluggy/_callers.py", line 121 in _multicall
+  File "/home/lee/.local/lib/python3.10/site-packages/pluggy/_manager.py", line 120 in _hookexec
+  File "/home/lee/.local/lib/python3.10/site-packages/pluggy/_hooks.py", line 512 in __call__
+  File "/home/lee/.local/lib/python3.10/site-packages/_pytest/config/__init__.py", line 199 in main
+  File "/home/lee/.local/lib/python3.10/site-packages/_pytest/config/__init__.py", line 223 in console_main
+  File "/home/lee/.local/bin/pytest", line 8 in <module>
+
+Extension modules: markupsafe._speedups, _brotli, charset_normalizer.md, numpy._core._multiarray_umath, numpy.linalg._umath_linalg, dearpygui._dearpygui, PIL._imaging, kiwisolver._cext, yaml._yaml, PIL._imagingmath (total: 10)

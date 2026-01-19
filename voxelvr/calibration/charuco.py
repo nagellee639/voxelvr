@@ -313,18 +313,29 @@ def estimate_pose(
         # ids is (N, 1) or (N,), flatten to indexing array
         obj_points = all_board_corners[ids.flatten()]
         
-        # corners is (N, 1, 2) or (N, 2), solvePnP handles both
+        # Choose solvePnP method based on point count
+        # DLT (used by ITERATIVE) needs 6+ points
+        # IPPE works with 4+ coplanar points (ChArUco corners are coplanar)
+        n_points = len(corners)
+        if n_points >= 6:
+            method = cv2.SOLVEPNP_ITERATIVE
+        else:
+            # Use IPPE for 4-5 coplanar points
+            method = cv2.SOLVEPNP_IPPE
         
         success, rvec, tvec = cv2.solvePnP(
             obj_points,
             corners,
             camera_matrix,
             distortion_coeffs,
-            flags=cv2.SOLVEPNP_ITERATIVE
+            flags=method
         )
         
         return success, rvec, tvec
         
     except Exception as e:
-        print(f"Pose estimation failed: {e}")
+        # Don't spam console with expected errors
+        if "6 points" not in str(e):
+            print(f"Pose estimation failed: {e}")
         return False, None, None
+
