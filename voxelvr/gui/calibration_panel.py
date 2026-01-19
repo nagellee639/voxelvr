@@ -130,7 +130,7 @@ class CalibrationPanel:
         # Auto-capture state
         self._last_capture_time: Dict[int, float] = {}
         self._last_capture_corners: Dict[int, np.ndarray] = {}
-        self._capture_cooldown = 1.0  # Seconds
+        self._capture_cooldown = 0.4  # Seconds
         self._movement_threshold = 50.0  # Pixel distance sum
         
         # Background computation
@@ -385,6 +385,9 @@ class CalibrationPanel:
             'all_cameras_captured': False
         }
         
+        # Track which cameras updated their timestamp in this frame
+        updated_cameras = set()
+        
         # Update visibility status for all cameras
         visible_cameras = []
         for cam_id in self._camera_ids:
@@ -396,8 +399,18 @@ class CalibrationPanel:
         
         self._state.all_cameras_visible = len(visible_cameras) == len(self._camera_ids)
         
+        # Identify eligible cameras (cooldown passed)
+        eligible_cameras = set()
+        for cam_id in visible_cameras:
+             last_time = self._last_capture_time.get(cam_id, 0)
+             if now - last_time >= self._capture_cooldown:
+                 eligible_cameras.add(cam_id)
+
         # Process each visible camera for intrinsic capture
         for cam_id in visible_cameras:
+            if cam_id not in eligible_cameras:
+                continue
+                
             det = detections[cam_id]
             corners = det.get('corners')
             
@@ -411,11 +424,6 @@ class CalibrationPanel:
             
             if status.intrinsic_computing:
                 continue  # Computation in progress
-            
-            # Check cooldown
-            last_time = self._last_capture_time.get(cam_id, 0)
-            if now - last_time < self._capture_cooldown:
-                continue
             
             # Check movement
             if cam_id in self._last_capture_corners:
@@ -441,7 +449,9 @@ class CalibrationPanel:
                 })
                 
                 status.intrinsic_frames_captured = len(self._intrinsic_frames[cam_id])
-                self._last_capture_time[cam_id] = now
+                
+                # Mark for timestamp update
+                updated_cameras.add(cam_id)
                 self._last_capture_corners[cam_id] = corners.copy()
                 
                 result['intrinsics_captured'].append(cam_id)
@@ -450,52 +460,69 @@ class CalibrationPanel:
                 if status.intrinsic_frames_captured >= status.intrinsic_frames_required:
                     self._trigger_intrinsic_computation(cam_id)
         
-        # Process pairwise extrinsics (when 2+ cameras see the board)
-        if len(visible_cameras) >= 2:
-            # For simplicity, we'll use the first visible camera's cooldown as reference
-            ref_cam = visible_cameras[0]
-            ref_time = self._last_capture_time.get(ref_cam, 0)
+        # Process pairwise extrinsics (when 2+ eligible cameras see the board)
+        # We check eligibility here again. If a camera was eligible and captured intrinsics, 
+        # it is still eligible for pairwise in this SAME frame.
+        eligible_visible = [c for c in visible_cameras if c in eligible_cameras]
+        
+        if len(eligible_visible) >= 2:
+            # Capture!
+            captured_pairs = []
             
-            if now - ref_time >= self._capture_cooldown:
-                # Store captures for all visible pairs
-                for i, cam1 in enumerate(visible_cameras):
-                    for cam2 in visible_cameras[i+1:]:
-                        # Use ordered tuple as key (smaller camera ID first)
-                        pair_key = (min(cam1, cam2), max(cam1, cam2))
+            # Store captures for all eligible visible pairs
+            for i, cam1 in enumerate(eligible_visible):
+                for cam2 in eligible_visible[i+1:]:
+                    # Use ordered tuple as key (smaller camera ID first)
+                    pair_key = (min(cam1, cam2), max(cam1, cam2))
+                    
+                    if pair_key not in self._pairwise_captures:
+                        self._pairwise_captures[pair_key] = []
+                    
+                    # Store frames for this pair
+                    pair_frames = {
+                        cam1: detections[cam1].get('frame'),
+                        cam2: detections[cam2].get('frame'),
+                    }
+                    
+                    # Only store if we have valid frames
+                    if pair_frames[cam1] is not None and pair_frames[cam2] is not None:
+                        self._pairwise_captures[pair_key].append({
+                            'frames': {k: v.copy() for k, v in pair_frames.items()},
+                            'detections': {
+                                cam1: detections[cam1],
+                                cam2: detections[cam2],
+                            },
+                            'timestamp': now,
+                        })
                         
-                        if pair_key not in self._pairwise_captures:
-                            self._pairwise_captures[pair_key] = []
+                        captured_pairs.append((cam1, cam2))
                         
-                        # Store frames for this pair
-                        pair_frames = {
-                            cam1: detections[cam1].get('frame'),
-                            cam2: detections[cam2].get('frame'),
-                        }
+                        # Track pairwise progress in camera status
+                        if cam2 not in self._state.cameras[cam1].pairwise_frames:
+                            self._state.cameras[cam1].pairwise_frames[cam2] = 0
+                        if cam1 not in self._state.cameras[cam2].pairwise_frames:
+                            self._state.cameras[cam2].pairwise_frames[cam1] = 0
                         
-                        # Only store if we have valid frames
-                        if pair_frames[cam1] is not None and pair_frames[cam2] is not None:
-                            self._pairwise_captures[pair_key].append({
-                                'frames': {k: v.copy() for k, v in pair_frames.items()},
-                                'detections': {
-                                    cam1: detections[cam1],
-                                    cam2: detections[cam2],
-                                },
-                                'timestamp': now,
-                            })
-                            
-                            result['pairwise_captured'].append((cam1, cam2))
-                            
-                            # Track pairwise progress in camera status
-                            if cam2 not in self._state.cameras[cam1].pairwise_frames:
-                                self._state.cameras[cam1].pairwise_frames[cam2] = 0
-                            if cam1 not in self._state.cameras[cam2].pairwise_frames:
-                                self._state.cameras[cam2].pairwise_frames[cam1] = 0
-                            
-                            self._state.cameras[cam1].pairwise_frames[cam2] += 1
-                            self._state.cameras[cam2].pairwise_frames[cam1] += 1
+                        self._state.cameras[cam1].pairwise_frames[cam2] += 1
+                        self._state.cameras[cam2].pairwise_frames[cam1] += 1
+            
+            if captured_pairs:
+                result['pairwise_captured'] = captured_pairs
                 
+                # Mark all involved cameras for timestamp update
+                # This ensures we respect cooldown even if we only did pairwise capture
+                for cam_id in eligible_visible:
+                    updated_cameras.add(cam_id)
+                    det = detections[cam_id]
+                    if 'corners' in det:
+                         self._last_capture_corners[cam_id] = det['corners'].copy()
+
                 # Check if we have enough pairwise data to trigger computation
                 self._check_and_trigger_pairwise_computation()
+        
+        # Apply timestamp updates
+        for cam_id in updated_cameras:
+            self._last_capture_time[cam_id] = now
         
         # Legacy: Process overall extrinsics (when ALL cameras see the board)
         # This is kept as a fallback/optimization when all cameras can see the board
@@ -770,6 +797,8 @@ class CalibrationPanel:
                 if result:
                     # Validate all camera transforms
                     bad_cameras = []
+                    
+                    # 1. Check for bad transforms
                     for cam_id, cam_data in result.cameras.items():
                         extr = cam_data.get('extrinsics', {})
                         transform = extr.get('transform_matrix')
@@ -779,8 +808,18 @@ class CalibrationPanel:
                             if not is_valid_transform(T):
                                 bad_cameras.append(cam_id)
                     
+                    # 2. Check for missing cameras (disconnected)
+                    for cam_id in self._camera_ids:
+                        if cam_id not in result.cameras:
+                             # It was dropped due to connectivity issues
+                             bad_cameras.append(cam_id)
+                             print(f"Camera {cam_id} was dropped from calibration (not connected)")
+                    
+                    # Remove duplicates
+                    bad_cameras = list(set(bad_cameras))
+                    
                     if bad_cameras:
-                        print(f"⚠ Cameras with bad transforms: {bad_cameras}")
+                        print(f"⚠ Cameras failed due to bad transforms or connectivity: {bad_cameras}")
                         print("  Resetting pairwise captures for affected camera pairs...")
                         self._reset_bad_pairs(bad_cameras)
                         # Don't complete - need to recapture
@@ -814,6 +853,14 @@ class CalibrationPanel:
         
         for pair in pairs_to_reset:
             self._pairwise_captures[pair] = []
+            cam_a, cam_b = pair
+            
+            # Reset progress counters in camera status
+            if cam_b in self._state.cameras[cam_a].pairwise_frames:
+                self._state.cameras[cam_a].pairwise_frames[cam_b] = 0
+            if cam_a in self._state.cameras[cam_b].pairwise_frames:
+                self._state.cameras[cam_b].pairwise_frames[cam_a] = 0
+                
             print(f"  Reset pair {pair}")
         
         self._notify_progress()
@@ -822,6 +869,15 @@ class CalibrationPanel:
         """Reset all pairwise captures for a fresh start."""
         for pair in self._pairwise_captures.keys():
             self._pairwise_captures[pair] = []
+            cam_a, cam_b = pair
+            
+            # Reset progress counters
+            if cam_a in self._state.cameras and cam_b in self._state.cameras:
+                if cam_b in self._state.cameras[cam_a].pairwise_frames:
+                    self._state.cameras[cam_a].pairwise_frames[cam_b] = 0
+                if cam_a in self._state.cameras[cam_b].pairwise_frames:
+                    self._state.cameras[cam_b].pairwise_frames[cam_a] = 0
+            
         self._notify_progress()
     
     def _trigger_extrinsic_computation(self) -> None:

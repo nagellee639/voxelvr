@@ -30,6 +30,7 @@ from voxelvr.config import VoxelVRConfig, CameraConfig, MultiCameraCalibration
 from voxelvr.gui import VoxelVRApp
 from voxelvr.gui.unified_app import UnifiedVoxelVRApp
 from voxelvr.gui.performance_panel import PerformanceMetrics
+from voxelvr.utils.logging import log_info, log_warn, log_error, log_debug, tracking_log, gui_log
 
 
 def run_tracking_thread(app: VoxelVRApp, config: VoxelVRConfig, calibration: MultiCameraCalibration):
@@ -39,7 +40,7 @@ def run_tracking_thread(app: VoxelVRApp, config: VoxelVRConfig, calibration: Mul
     This is started when the user clicks "Start Tracking" in the GUI.
     """
     from voxelvr.capture import CameraManager
-    from voxelvr.pose import PoseDetector2D, PoseFilter
+    from voxelvr.pose import PoseDetector2D, PoseFilter, ConfidenceFilter
     from voxelvr.pose.triangulation import TriangulationPipeline, compute_projection_matrices
     from voxelvr.transport import OSCSender
     from voxelvr.transport.osc_sender import pose_to_trackers_with_rotations
@@ -55,9 +56,9 @@ def run_tracking_thread(app: VoxelVRApp, config: VoxelVRConfig, calibration: Mul
     osc_ip, osc_port = app.tracking_panel.get_osc_config()
     enabled_trackers = app.tracking_panel.get_enabled_trackers()
     
-    print(f"Debug: Initial enabled trackers: {enabled_trackers}")
+    tracking_log.debug(f"Initial enabled trackers: {enabled_trackers}")
     if not enabled_trackers:
-        print("Warning: No trackers enabled! Forcing all enabled for debugging.")
+        tracking_log.warn("No trackers enabled! Forcing all enabled for debugging.")
         enabled_trackers = ["hip", "chest", "left_foot", "right_foot", "left_knee", "right_knee", "left_elbow", "right_elbow"]
     
     # Setup camera manager
@@ -72,11 +73,11 @@ def run_tracking_thread(app: VoxelVRApp, config: VoxelVRConfig, calibration: Mul
     osc_sender = None
     
     try:
-        print("Initializing camera manager...")
+        tracking_log.info("Initializing camera manager...")
         
         # Check if app already has an active camera manager (UnifiedVoxelVRApp)
         if hasattr(app, 'camera_manager') and app.camera_manager:
-            print("Using existing camera manager from app")
+            tracking_log.info("Using existing camera manager from app")
             camera_manager = app.camera_manager
             # Ensure it has the right calibration
             camera_manager.load_calibration(calibration)
@@ -87,8 +88,8 @@ def run_tracking_thread(app: VoxelVRApp, config: VoxelVRConfig, calibration: Mul
         
         
         # Load pose detector
-        print("Loading pose detector model...")
-        detector = PoseDetector2D(confidence_threshold=0.3)
+        tracking_log.info("Loading pose detector model...")
+        detector = PoseDetector2D(confidence_threshold=config.tracking.confidence_threshold)
         if not detector.load_model():
             app.tracking_panel.on_tracking_error("Failed to load pose model")
             return
@@ -98,6 +99,7 @@ def run_tracking_thread(app: VoxelVRApp, config: VoxelVRConfig, calibration: Mul
         extrinsics_list = []
         
         for cam_id, data in calibration.cameras.items():
+            print(f"DEBUG: Loading calibration for cam {cam_id}. Keys: {list(data.keys())}")
             if cam_id in camera_ids:
                 intrinsics_list.append(CameraIntrinsics(**data['intrinsics']))
                 extrinsics_list.append(CameraExtrinsics(**data['extrinsics']))
@@ -105,7 +107,7 @@ def run_tracking_thread(app: VoxelVRApp, config: VoxelVRConfig, calibration: Mul
         projection_matrices = compute_projection_matrices(intrinsics_list, extrinsics_list)
         
         # Create pipeline components
-        triangulation = TriangulationPipeline(projection_matrices, confidence_threshold=0.3)
+        triangulation = TriangulationPipeline(projection_matrices, confidence_threshold=config.tracking.confidence_threshold)
         
         # Get filter parameters from debug panel
         optimizer = app.debug_panel.optimizer
@@ -126,9 +128,9 @@ def run_tracking_thread(app: VoxelVRApp, config: VoxelVRConfig, calibration: Mul
         coord_transform = create_default_transform()
         
         # OSC sender
-        print("Connecting OSC...")
+        tracking_log.info("Connecting OSC...")
         if hasattr(app, 'osc_sender') and app.osc_sender:
-             print("Using existing OSC sender from app")
+             tracking_log.info("Using existing OSC sender from app")
              osc_sender = app.osc_sender
         else:
              osc_sender = OSCSender(ip=osc_ip, port=osc_port, send_rate=60.0)
@@ -142,13 +144,13 @@ def run_tracking_thread(app: VoxelVRApp, config: VoxelVRConfig, calibration: Mul
             osc_sender.enable_tracker(tracker_name, tracker_name in enabled_trackers)
         
         # Start cameras
-        print("Starting cameras...")
+        tracking_log.info("Starting cameras...")
         if not camera_manager.start_all():
             app.tracking_panel.on_tracking_error("Failed to start cameras")
             return
         
         # Notify started - this updates the GUI
-        print("Tracking started!")
+        tracking_log.info("Tracking started!")
         app.tracking_panel.on_tracking_started()
         app.osc_status.on_connect()
         
@@ -156,6 +158,16 @@ def run_tracking_thread(app: VoxelVRApp, config: VoxelVRConfig, calibration: Mul
         frame_count = 0
         start_time = time.time()
         
+        # Initialize or reset confidence filter
+        if not hasattr(app, 'confidence_filter'):
+            app.confidence_filter = ConfidenceFilter(
+                confidence_threshold=config.tracking.confidence_threshold, 
+                grace_period_frames=config.tracking.confidence_grace_period_frames, 
+                reactivation_frames=config.tracking.confidence_reactivation_frames
+            )
+        else:
+            app.confidence_filter.reset()
+            
         while app.tracking_panel.is_running and app.state.is_running:
             loop_start = time.time()
             
@@ -166,7 +178,7 @@ def run_tracking_thread(app: VoxelVRApp, config: VoxelVRConfig, calibration: Mul
             
             frames = {cam_id: f.image for cam_id, f in frames_raw.items()}
             capture_time = time.time() - loop_start
-            
+
             # 2D pose detection and GUI Update
             detect_start = time.time()
             keypoints_2d = {}
@@ -176,48 +188,93 @@ def run_tracking_thread(app: VoxelVRApp, config: VoxelVRConfig, calibration: Mul
                 if kp:
                     keypoints_2d[cam_id] = kp
             
+            # Filter 2D keypoints using hysteresis (Grace Period)
+            # This handles "low confidence for more than 7 frames" logic
+            if not hasattr(app, 'confidence_filter'):
+                app.confidence_filter = ConfidenceFilter(
+                    confidence_threshold=config.tracking.confidence_threshold, 
+                    grace_period_frames=config.tracking.confidence_grace_period_frames, 
+                    reactivation_frames=config.tracking.confidence_reactivation_frames
+                )
+            
+            filtered_kps, diagnostics = app.confidence_filter.update(list(keypoints_2d.values()))
+            
             # Send 2D detections to GUI for visualization (avoids double inference)
             if hasattr(app, 'update_2d_detections'):
-                app.update_2d_detections(keypoints_2d)
+                 app.update_2d_detections(keypoints_2d) # Visualize RAW detections
             
             detect_time = time.time() - detect_start
+            
+            # Performance Logging to CSV (after detect_time is computed)
+            if frame_count % 60 == 0 and frame_count > 0:
+                 with open("performance_log.csv", "a") as f:
+                     f.write(f"{time.time()},{capture_time*1000:.1f},{detect_time*1000:.1f},{triang_time*1000:.1f},{filter_time*1000:.1f},{osc_time*1000:.1f},{total_time*1000:.1f}\n")
             
             # 3D triangulation
             triang_start = time.time()
             pose_3d = None
+            valid_mask = np.zeros(17, dtype=bool) # Default invalid
+            confidences = np.zeros(17, dtype=float)
+            positions = np.zeros((17, 3), dtype=float)
             
             # Debug: Print detection status every 60 frames
             if frame_count % 60 == 0:
-                det_status = [f"Cam{k}:{len(v.positions) if hasattr(v, 'positions') else 0}" for k,v in keypoints_2d.items()]
+                det_status = []
+                for k, v in keypoints_2d.items():
+                    n_kps = len(v.positions) if hasattr(v, 'positions') else 0
+                    if n_kps > 0:
+                        avg_conf = np.mean(v.confidences)
+                        det_status.append(f"Cam{k}:{n_kps}(conf={avg_conf:.2f})")
+                    else:
+                        det_status.append(f"Cam{k}:0")
+                
                 print(f"Debug [{frame_count}]: Detections in {len(keypoints_2d)} cams: {det_status}")
             
-            if len(keypoints_2d) >= 2:
-                kp_list = list(keypoints_2d.values())
+            if len(filtered_kps) >= 2:
                 try:
-                    pose_3d = triangulation.process(kp_list)
-                    
-                    # Debug: Print triangulation result
-                    if frame_count % 60 == 0:
-                        if pose_3d:
-                            valid_cnt = np.sum(pose_3d['valid'])
+                    result = triangulation.process(filtered_kps)
+                    if result:
+                         pose_3d = result
+                         positions = pose_3d['positions']
+                         valid_mask = pose_3d['valid']
+                         confidences = pose_3d['confidences']
+                         
+                         # Debug: Print triangulation result
+                         if frame_count % 60 == 0:
+                            valid_cnt = np.sum(valid_mask)
                             print(f"Debug [{frame_count}]: Triangulation produced {valid_cnt} valid joints")
-                        else:
-                             print(f"Debug [{frame_count}]: Triangulation returned None")
+                    else:
+                         if frame_count % 60 == 0:
+                             print(f"Debug [{frame_count}]: Triangulation returned None (pipeline failed)")
                 except Exception as e:
-                    print(f"Triangulation Error: {e}")
+                    tracking_log.error(f"Triangulation Error: {e}")
             else:
                  if frame_count % 60 == 0:
-                    print(f"Debug [{frame_count}]: Skipping triangulation - need 2+ cameras, have {len(keypoints_2d)}")
+                    print(f"Debug [{frame_count}]: Skipping triangulation - need 2+ active cameras, have {len(filtered_kps)}")
             
-            # Fallback for debug: T-Pose if no data
-            if pose_3d is None:
-                pose_3d = get_tpose()
-                if frame_count % 60 == 0:
-                    print(f"Debug [{frame_count}]: Using fallback T-Pose")
-
+            # --- Freezing Logic (Per-Joint) ---
+            # Instead of T-Pose fallback, use ConfidenceFilter to apply freezing
+            # If triangulation failed (pose_3d is None), valid_mask is all False, 
+            # so apply_freezing will simply return last confident positions (or T-pose if never valid)
+            
+            positions = app.confidence_filter.apply_freezing(positions, valid_mask)
+            
+            # Reconstruct pose_3d object for downstream
+            pose_3d = {
+                'positions': positions,
+                'valid': valid_mask, # Note: Downstream might filter invalid, but frozen positions are "valid" for user
+                'confidences': confidences
+            }
+            
+            # Mark frozen joints as valid tracking so they are sent via OSC
+            # (If we don't, OSC sender might drop them)
+            # app.confidence_filter.has_tracking_history ensures we don't send initial T-pose as "valid" endlessly if no tracking yet
+            if app.confidence_filter.has_tracking_history:
+                 pose_3d['valid'] = np.ones(17, dtype=bool) # Treat all frozen as valid output
+            
             triang_time = time.time() - triang_start
             
-            # Apply temporal filter
+            # Apply temporal filter (OneEuro)
             filter_start = time.time()
             if pose_3d:
                 pose_3d['positions'] = pose_filter.filter(
@@ -232,15 +289,33 @@ def run_tracking_thread(app: VoxelVRApp, config: VoxelVRConfig, calibration: Mul
                 )
             filter_time = time.time() - filter_start
             
+            # Update post-calibration (feed poses if in capturing state)
+            if hasattr(app, 'post_calibrator') and pose_3d:
+                app.post_calibrator.update(pose_3d['positions'], pose_3d['valid'])
+                # Update UI status (call every frame for smooth countdown)
+                if hasattr(app, '_update_postcalib_status'):
+                    app._update_postcalib_status()
+            
+            # Get the appropriate coordinate transform
+            # Use post-calibrator transform if calibration is complete
+            if hasattr(app, 'post_calibrator'):
+                postcalib_transform = app.post_calibrator.get_transform()
+                if postcalib_transform is not None:
+                    active_transform = postcalib_transform
+                else:
+                    active_transform = coord_transform
+            else:
+                active_transform = coord_transform
+            
             # Transform and send via OSC
             osc_start = time.time()
             trackers_sent = 0
             
             if pose_3d and np.any(pose_3d['valid']):
-                # Transform coordinates
+                # Transform coordinates using active transform (post-calib or default)
                 transformed, _ = transform_pose_to_vrchat(
                     pose_3d['positions'],
-                    coord_transform,
+                    active_transform,
                 )
                 
                 # Convert to VRChat trackers
@@ -254,8 +329,8 @@ def run_tracking_thread(app: VoxelVRApp, config: VoxelVRConfig, calibration: Mul
                 trackers = {k: v for k, v in trackers.items() if k in enabled_trackers}
                 
                 # Debug OSC every 60 frames
-                if frame_count % 60 == 0:
-                     print(f"Debug [{frame_count}]: Sending {len(trackers)} trackers: {list(trackers.keys())}")
+                if frame_count % 60 == 0 and len(trackers) > 0:
+                     print(f"Debug [{frame_count}]: Sending {len(trackers)} trackers")
                 
                 # Send via OSC
                 if osc_sender.send_all_trackers(trackers):
@@ -271,6 +346,7 @@ def run_tracking_thread(app: VoxelVRApp, config: VoxelVRConfig, calibration: Mul
             
             osc_time = time.time() - osc_start
             total_time = time.time() - loop_start
+
             
             # Update performance metrics
             metrics = PerformanceMetrics(
@@ -311,7 +387,7 @@ def run_tracking_thread(app: VoxelVRApp, config: VoxelVRConfig, calibration: Mul
             if not is_shared:
                 camera_manager.stop_all()
             else:
-                print("Leaving shared camera manager running")
+                tracking_log.info("Leaving shared camera manager running")
         if 'osc_sender' in locals() and osc_sender:
              # Only disconnect if we created it privately
             if not (hasattr(app, 'osc_sender') and app.osc_sender is osc_sender):
@@ -351,6 +427,11 @@ def main():
         action="store_true",
         help="Record time-synced video from all cameras"
     )
+    parser.add_argument(
+        "--cpu",
+        action="store_true",
+        help="Force CPU-only mode for pose detection (skip GPU)"
+    )
     
     args = parser.parse_args()
     
@@ -363,25 +444,32 @@ def main():
     calibration_path = args.calibration or (config.calibration_dir / "calibration.json")
     
     if calibration_path.exists():
-        print(f"Loading calibration: {calibration_path}")
+        gui_log.info(f"Loading calibration: {calibration_path}")
         calibration = MultiCameraCalibration.load(calibration_path)
     
     # Create application (unified is now the default)
     if args.legacy:
-        print("Starting legacy interface...")
+        gui_log.info("Starting legacy interface...")
         app = VoxelVRApp(
             title="VoxelVR - Full Body Tracking",
             width=args.width,
             height=args.height,
         )
     else:
-        print("Starting unified interface...")
+        gui_log.info("Starting unified interface...")
         app = UnifiedVoxelVRApp(
             title="VoxelVR - Unified Tracking",
             width=args.width,
             height=args.height,
+            force_cpu=args.cpu,
+            config=config,
         )
+
         
+        # Load calibration into app if available
+        if calibration:
+            app.load_calibration(calibration)
+            
         # Enable recording if requested
         if args.record:
             app.enable_recording()
@@ -396,10 +484,10 @@ def main():
         active_calibration = calibration
         if hasattr(app, 'calibration_panel') and app.calibration_panel.state.extrinsics.result:
             active_calibration = app.calibration_panel.state.extrinsics.result
-            print(f"Using computed calibration with {len(active_calibration.cameras)} cameras")
+            tracking_log.info(f"Using computed calibration with {len(active_calibration.cameras)} cameras")
         
         if active_calibration is None:
-            print("Tracking error: No calibration loaded")
+            tracking_log.error("No calibration loaded")
             # For unified app, don't use tracking_panel (it doesn't exist)
             if hasattr(app, 'tracking_panel'):
                 app.tracking_panel.on_tracking_error("No calibration loaded")
@@ -422,13 +510,13 @@ def main():
     )
     
     # Run application
-    print("Starting VoxelVR GUI...")
-    print("Press Ctrl+C or close window to exit.")
+    gui_log.info("Starting VoxelVR GUI...")
+    gui_log.info("Press Ctrl+C or close window to exit.")
     
     try:
         app.run()
     except KeyboardInterrupt:
-        print("\nShutting down...")
+        gui_log.info("Shutting down...")
         app.request_stop()
     
     return 0

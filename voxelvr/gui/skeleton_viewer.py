@@ -12,7 +12,7 @@ import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 from io import BytesIO
 from PIL import Image
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Dict
 import time
 
 
@@ -115,7 +115,22 @@ class SkeletonViewer:
         # Last update time for frame rate control
         self._last_update = time.time()
         self._target_fps = 30.0
+        
+        # Camera visualization
+        self.camera_positions: Dict[int, np.ndarray] = {}  # camera_id -> 4x4 transform
+        self.show_cameras = True
     
+    
+    def set_camera_positions(self, camera_transforms: Dict[int, np.ndarray]) -> None:
+        """
+        Set camera positions for visualization.
+        
+        Args:
+            camera_transforms: Dict mapping camera_id to 4x4 transform (camera-to-world)
+        """
+        self.camera_positions = camera_transforms
+        print(f"SkeletonViewer: Set {len(camera_transforms)} camera positions: {list(camera_transforms.keys())}")
+
     def set_auto_rotate(self, enabled: bool) -> None:
         """Enable or disable automatic rotation."""
         self.auto_rotate = enabled
@@ -228,6 +243,34 @@ class SkeletonViewer:
                     color = self._confidence_to_color(avg_conf)
                     
                     self.ax.plot3D(*points.T, color=color, linewidth=2)
+                    
+        # Plot cameras (debug)
+        # print(f"DEBUG render: show_cameras={self.show_cameras}, num_cameras={len(self.camera_positions)}")
+        if self.show_cameras and self.camera_positions:
+            for cam_id, T in self.camera_positions.items():
+                # Extract position
+                pos = T[:3, 3]
+                
+                # Convert to Z-up for plotting
+                pos_plot = np.array([pos[0], pos[2], pos[1]])
+
+                
+                # Draw camera center
+                self.ax.scatter(*pos_plot, c='red', s=100, marker='^', edgecolors='black')
+                self.ax.text(pos_plot[0], pos_plot[1], pos_plot[2]+0.1, f"Cam {cam_id}", fontsize=8)
+                
+                # Draw frustum (approximate view direction)
+                # Camera looks down +Z in its local frame (standard OpenCV)
+                # But we need world direction. 
+                # Local Z axis is 3rd column of rotation matrix
+                R = T[:3, :3]
+                view_dir = R[:, 2] # Z axis
+                
+                # Plot direction vector
+                end_pos = pos + view_dir * 0.3
+                end_plot = np.array([end_pos[0], end_pos[2], end_pos[1]])
+                
+                self.ax.plot3D(*zip(pos_plot, end_plot), color='red', alpha=0.5, linewidth=1)
         
         # Plot floor grid (optional)
         if self.show_floor:
@@ -249,14 +292,100 @@ class SkeletonViewer:
             self.ax.set_ylabel('')
             self.ax.set_zlabel('')
         
-        # Set equal aspect ratio and limits
-        max_range = self.distance
-        center = plot_points[confidences > 0.5].mean(axis=0) if np.any(confidences > 0.5) else np.zeros(3)
+        # Determine view bounds
+        # The origin should be where the cameras are looking (the capture volume center)
+        # This is approximated by finding where camera view rays intersect
         
-        # For Z-up, we generally want Z to start at 0
+        # Calculate focal point from cameras if available
+        focal_point = None
+        if self.camera_positions and len(self.camera_positions) >= 2:
+            # Compute approximate intersection of camera view rays
+            # Each camera looks down its +Z axis in local frame
+            intersection_points = []
+            cameras = list(self.camera_positions.items())
+            
+            for i, (cam_id_a, T_a) in enumerate(cameras):
+                for j, (cam_id_b, T_b) in enumerate(cameras):
+                    if i >= j:
+                        continue
+                    
+                    # Camera positions
+                    p_a = T_a[:3, 3]
+                    p_b = T_b[:3, 3]
+                    
+                    # Camera view directions (Z axis of rotation matrix)
+                    R_a = T_a[:3, :3]
+                    R_b = T_b[:3, :3]
+                    d_a = R_a[:, 2]  # Z axis direction
+                    d_b = R_b[:, 2]
+                    
+                    # Find closest point between two rays
+                    # Ray A: p_a + t*d_a, Ray B: p_b + s*d_b
+                    # Closest points when (p_a + t*d_a - p_b - s*d_b) is perpendicular to both d_a and d_b
+                    w0 = p_a - p_b
+                    a = np.dot(d_a, d_a)
+                    b = np.dot(d_a, d_b)
+                    c = np.dot(d_b, d_b)
+                    d = np.dot(d_a, w0)
+                    e = np.dot(d_b, w0)
+                    
+                    denom = a * c - b * b
+                    if abs(denom) > 1e-6:  # Rays are not parallel
+                        t = (b * e - c * d) / denom
+                        s = (a * e - b * d) / denom
+                        
+                        # Only use if intersection is in front of both cameras (positive t and s)
+                        if t > 0 and s > 0:
+                            pt_a = p_a + t * d_a
+                            pt_b = p_b + s * d_b
+                            midpoint = (pt_a + pt_b) / 2
+                            intersection_points.append(midpoint)
+            
+            if intersection_points:
+                # Average of all pairwise intersections
+                focal_point = np.mean(intersection_points, axis=0)
+                # Push down to floor level (Y=0), keep X and Z
+                focal_point[1] = 0  # Set Y (height) to 0
+        
+        # Build all points for extent calculation
+        all_points = []
+        
+        # Add valid skeleton points
+        if np.any(confidences > 0.5):
+            valid_points = plot_points[confidences > 0.5]
+            all_points.append(valid_points)
+            
+        # Add camera points
+        if self.camera_positions:
+            cam_points = []
+            for T in self.camera_positions.values():
+                pos = T[:3, 3]
+                cam_points.append([pos[0], pos[2], pos[1]])  # Z-up for matplotlib
+            all_points.append(np.array(cam_points))
+        
+        # Determine center
+        if focal_point is not None:
+            # Use focal point as center (convert to Z-up: X stays, Z->Y, Y->Z)
+            center = np.array([focal_point[0], focal_point[2], focal_point[1]])
+        elif all_points:
+            all_points_cat = np.vstack(all_points)
+            center = all_points_cat.mean(axis=0)
+        else:
+            center = np.zeros(3)
+        
+        # Determine extent (view range)
+        max_range = self.distance
+        if all_points:
+            all_points_cat = np.vstack(all_points)
+            if len(all_points_cat) > 1:
+                ptp = np.ptp(all_points_cat, axis=0)
+                extent = ptp.max()
+                if extent > max_range:
+                    max_range = extent * 1.2  # Add 20% margin
+        
         self.ax.set_xlim([center[0] - max_range/2, center[0] + max_range/2])
         self.ax.set_ylim([center[1] - max_range/2, center[1] + max_range/2])
-        self.ax.set_zlim([0, max_range])
+        self.ax.set_zlim([0, max_range])  # Z starts at 0 (floor)
         
         # Force aspect ratio to be equal (cubic) so it doesn't look distorted
         self.ax.set_box_aspect((1, 1, 1))
@@ -302,6 +431,9 @@ class SkeletonViewer:
         Returns:
             RGBA array with shape (H, W, 4) and values 0-1
         """
+        # Force draw to initialize 3D projection matrix before saving
+        self.fig.canvas.draw()
+        
         buf = BytesIO()
         self.fig.savefig(buf, format='png', dpi=100)
         buf.seek(0)

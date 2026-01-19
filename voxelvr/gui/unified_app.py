@@ -22,6 +22,8 @@ from .performance_panel import PerformancePanel, PerformanceMetrics
 from .debug_panel import DebugPanel
 from .skeleton_viewer import SkeletonViewer, get_tpose
 from ..transport.osc_sender import OSCSender
+from ..config import VoxelVRConfig
+from ..utils.logging import log_info, log_warn, log_error, log_debug, osc_log, calibration_log, camera_log
 
 
 class UnifiedVoxelVRApp:
@@ -40,10 +42,16 @@ class UnifiedVoxelVRApp:
         title: str = "VoxelVR - Unified Tracking",
         width: int = 1400,
         height: int = 900,
+        force_cpu: bool = False,
+        config: Optional[VoxelVRConfig] = None,
     ):
         self.title = title
         self.width = width
         self.height = height
+        self.force_cpu = force_cpu
+        
+        # Load config if not provided
+        self.config = config if config is not None else VoxelVRConfig.load()
         
         # Core view state
         self.view = UnifiedView()
@@ -54,13 +62,29 @@ class UnifiedVoxelVRApp:
         self.skeleton_viewer = SkeletonViewer(size=(400, 400))
         
         # Calibration panel for pairwise capture logic
+        # Calibration panel for pairwise capture logic
         from .calibration_panel import CalibrationPanel
-        self.calibration_panel = CalibrationPanel()
+        self.calibration_panel = CalibrationPanel(
+            charuco_squares_x=self.config.calibration.charuco_squares_x,
+            charuco_squares_y=self.config.calibration.charuco_squares_y,
+            charuco_square_length=self.config.calibration.charuco_square_length,
+            charuco_marker_length=self.config.calibration.charuco_marker_length,
+            charuco_dict=self.config.calibration.charuco_dict,
+            intrinsic_frames_required=self.config.calibration.intrinsic_frames_required,
+            extrinsic_frames_required=self.config.calibration.extrinsic_frames_required,
+        )
         self.calibration_panel.add_progress_callback(self._on_calibration_progress)
         
         # ChArUco board for detection
+        # ChArUco board for detection
         from ..calibration.charuco import create_charuco_board
-        self._charuco_board, self._aruco_dict = create_charuco_board()
+        self._charuco_board, self._aruco_dict = create_charuco_board(
+            squares_x=self.config.calibration.charuco_squares_x,
+            squares_y=self.config.calibration.charuco_squares_y,
+            square_length=self.config.calibration.charuco_square_length,
+            marker_length=self.config.calibration.charuco_marker_length,
+            dictionary=self.config.calibration.charuco_dict,
+        )
         
         # DearPyGui resources
         self._texture_registry: Optional[int] = None
@@ -70,6 +94,7 @@ class UnifiedVoxelVRApp:
         # Threading
         self._stop_event = threading.Event()
         self._update_thread: Optional[threading.Thread] = None
+        self._grid_lock = threading.Lock()
         
         # Camera preview
         from ..capture.manager import CameraManager
@@ -80,9 +105,13 @@ class UnifiedVoxelVRApp:
         # OSC Sender (Owner)
         self.osc_sender = OSCSender(ip="127.0.0.1", port=9000)
         
+        # Post-calibration (origin/axis alignment for VRChat)
+        from ..transport.post_calibration import PostCalibrator
+        self.post_calibrator = PostCalibrator()
+        
         # Idle OSC Loop
         self._idle_osc_thread: Optional[threading.Thread] = None
-        
+
         
         # Recording support
         self._recording_enabled = False
@@ -140,6 +169,28 @@ class UnifiedVoxelVRApp:
         """Set external callbacks for tracking lifecycle."""
         self._on_start_tracking = on_start
         self._on_stop_tracking = on_stop
+
+    def load_calibration(self, calibration: object) -> None:
+        """
+        Load an existing calibration.
+        
+        Args:
+            calibration: MultiCameraCalibration object
+        """
+        # Load into calibration panel (if supported)
+        # self.calibration_panel.load_calibration(calibration)
+        
+        # Update skeleton viewer with camera positions
+        camera_transforms = {}
+        for cam_id, data in calibration.cameras.items():
+            if 'extrinsics' in data:
+                # Get transform matrix
+                T = np.array(data['extrinsics']['transform_matrix'])
+                camera_transforms[cam_id] = T
+        
+        if camera_transforms:
+            self.skeleton_viewer.set_camera_positions(camera_transforms)
+            calibration_log.info(f"Loaded {len(camera_transforms)} cameras into 3D viewer")
     
     def setup(self) -> None:
         """Initialize DearPyGui context and window."""
@@ -329,6 +380,38 @@ class UnifiedVoxelVRApp:
                     
                     dpg.add_spacer(height=10)
                     
+                    # Post-calibration section
+                    dpg.add_text("Post-Calibration", color=(150, 200, 255))
+                    dpg.add_separator()
+                    
+                    dpg.add_button(
+                        label="🎯 Calibrate Origin",
+                        tag="postcalib_btn",
+                        callback=self._on_postcalib_click,
+                        width=-1,
+                        height=40,
+                    )
+                    dpg.add_text(
+                        "Click to calibrate",
+                        tag="postcalib_status",
+                        color=(120, 120, 120),
+                    )
+                    
+                    # Y-rotation adjustment
+                    dpg.add_text("Yaw Offset", color=(120, 120, 120))
+                    with dpg.group(horizontal=True):
+                        dpg.add_button(label="-90°", callback=lambda: self._adjust_yaw(-90), width=45)
+                        dpg.add_button(label="-45°", callback=lambda: self._adjust_yaw(-45), width=45)
+                        dpg.add_button(label="-15°", callback=lambda: self._adjust_yaw(-15), width=45)
+                    with dpg.group(horizontal=True):
+                        dpg.add_button(label="Reset", callback=lambda: self._reset_yaw(), width=45)
+                        dpg.add_button(label="+15°", callback=lambda: self._adjust_yaw(15), width=45)
+                        dpg.add_button(label="+45°", callback=lambda: self._adjust_yaw(45), width=45)
+                        dpg.add_button(label="+90°", callback=lambda: self._adjust_yaw(90), width=45)
+                    dpg.add_text("0°", tag="yaw_offset_label", color=(100, 200, 100))
+                    
+                    dpg.add_spacer(height=10)
+                    
                     # AprilTag toggle
                     dpg.add_checkbox(
                         label="🎯 AprilTag Precision Mode",
@@ -347,6 +430,7 @@ class UnifiedVoxelVRApp:
                             callback=self._on_export_apriltag_click,
                         )
                     
+
                     dpg.add_separator()
                     
                     # OSC Settings
@@ -548,74 +632,106 @@ class UnifiedVoxelVRApp:
     
     def _update_camera_grid(self, camera_ids: List[int]) -> None:
         """Update camera grid display with proper row/column layout."""
-        dpg.delete_item("camera_grid", children_only=True)
-        
-        if not camera_ids:
-            dpg.add_text("No cameras detected.", parent="camera_grid")
-            return
-        
-        rows, cols = self.view.get_camera_grid_layout()
-        scaled_w, scaled_h = self._get_scaled_camera_size()
-        
-        # Create textures first (recreate if size changed)
-        for cam_id in camera_ids:
-            texture_tag = f"cam_texture_{cam_id}"
+        with self._grid_lock:
+            dpg.delete_item("camera_grid", children_only=True)
             
-            # Delete old texture if exists (size may have changed)
-            if dpg.does_item_exist(texture_tag):
-                dpg.delete_item(texture_tag)
-                if cam_id in self._camera_textures:
-                    del self._camera_textures[cam_id]
+            if not camera_ids:
+                dpg.add_text("No cameras detected.", parent="camera_grid")
+                return
             
-            # Create placeholder texture with scaled size
-            placeholder = np.zeros((scaled_h, scaled_w, 4), dtype=np.float32)
-            placeholder[:, :, 3] = 1.0
+            rows, cols = self.view.get_camera_grid_layout()
+            scaled_w, scaled_h = self._get_scaled_camera_size()
             
-            self._camera_textures[cam_id] = dpg.add_dynamic_texture(
-                width=scaled_w,
-                height=scaled_h,
-                default_value=placeholder.flatten().tolist(),
-                parent=self._texture_registry,
-                tag=texture_tag,
-            )
-        
-        # Arrange cameras in grid
-        cam_idx = 0
-        for row in range(rows):
-            # Create horizontal group for each row
-            with dpg.group(horizontal=True, parent="camera_grid"):
-                for col in range(cols):
-                    if cam_idx >= len(camera_ids):
-                        break
-                    
-                    cam_id = camera_ids[cam_idx]
-                    texture_tag = f"cam_texture_{cam_id}"
-                    
-                    # Camera cell with label and image
-                    with dpg.group():
-                        dpg.add_text(f"Camera {cam_id}")
-                        dpg.add_image(texture_tag)
-                    
-                    # Spacer between cameras in row (except last)
-                    if col < cols - 1 and cam_idx < len(camera_ids) - 1:
-                        dpg.add_spacer(width=10)
-                    
-                    cam_idx += 1
+            # Create textures first (recreate if size changed)
+            for cam_id in camera_ids:
+                texture_tag = f"cam_texture_{cam_id}"
+                
+                # Delete old texture if exists (size may have changed)
+                if dpg.does_item_exist(texture_tag):
+                    dpg.delete_item(texture_tag)
+                    if cam_id in self._camera_textures:
+                        del self._camera_textures[cam_id]
+                
+                # Create placeholder texture with scaled size
+                placeholder = np.zeros((scaled_h, scaled_w, 4), dtype=np.float32)
+                placeholder[:, :, 3] = 1.0
+                
+                self._camera_textures[cam_id] = dpg.add_dynamic_texture(
+                    width=scaled_w,
+                    height=scaled_h,
+                    default_value=placeholder.flatten().tolist(),
+                    parent=self._texture_registry,
+                    tag=texture_tag,
+                )
+            
+            # Arrange cameras in grid
+            cam_idx = 0
+            for row in range(rows):
+                # Create horizontal group for each row
+                with dpg.group(horizontal=True, parent="camera_grid"):
+                    for col in range(cols):
+                        if cam_idx >= len(camera_ids):
+                            break
+                        
+                        cam_id = camera_ids[cam_idx]
+                        texture_tag = f"cam_texture_{cam_id}"
+                        
+                        # Camera cell with label and image
+                        with dpg.group():
+                            dpg.add_text(f"Camera {cam_id}")
+                            dpg.add_image(texture_tag)
+                        
+                        # Spacer between cameras in row (except last)
+                        if col < cols - 1 and cam_idx < len(camera_ids) - 1:
+                            dpg.add_spacer(width=10)
+                        
+                        cam_idx += 1
     
     def update_camera_frame(self, camera_id: int, frame: np.ndarray) -> None:
-        """Update a camera's texture with new frame."""
+        """Update a camera's texture with new frame (optimized)."""
         texture_tag = f"cam_texture_{camera_id}"
         
+        # Helper to avoid lock overhead if obviously missing
+        # (Though race condition can still happen after this check, hence the lock below)
         if not dpg.does_item_exist(texture_tag):
             return
         
-        # Resize to scaled grid cell size (4:3 aspect ratio)
+        # Get target size
         scaled_w, scaled_h = self._get_scaled_camera_size()
-        frame_resized = cv2.resize(frame, (scaled_w, scaled_h))
-        frame_rgba = cv2.cvtColor(frame_resized, cv2.COLOR_BGR2RGBA)
-        frame_float = frame_rgba.astype(np.float32) / 255.0
         
-        dpg.set_value(texture_tag, frame_float.flatten().tolist())
+        # Use pre-allocated buffer if available (avoids repeated allocation)
+        buffer_key = (scaled_w, scaled_h)
+        if not hasattr(self, '_texture_buffers'):
+            self._texture_buffers = {}
+        
+        if buffer_key not in self._texture_buffers:
+            # Pre-allocate float32 RGBA buffer
+            self._texture_buffers[buffer_key] = np.empty((scaled_h, scaled_w, 4), dtype=np.float32)
+        
+        buffer = self._texture_buffers[buffer_key]
+        
+        # Resize directly (uses OpenCV's optimized routines)
+        frame_resized = cv2.resize(frame, (scaled_w, scaled_h))
+        
+        # Convert BGR to RGBA and normalize in one pass
+        # This is faster than separate cvtColor + division
+        buffer[:, :, 0] = frame_resized[:, :, 2] / 255.0  # R from B
+        buffer[:, :, 1] = frame_resized[:, :, 1] / 255.0  # G from G  
+        buffer[:, :, 2] = frame_resized[:, :, 0] / 255.0  # B from R
+        buffer[:, :, 3] = 1.0  # Alpha
+        
+        # Update texture with contiguous flattened data
+        # PROTECTED UPDATE: Lock against grid rebuilding and catch internal errors
+        with self._grid_lock:
+            try:
+                if dpg.does_item_exist(texture_tag):
+                    dpg.set_value(texture_tag, buffer.ravel())
+            except SystemError:
+                # Can happen if item is deleted during set_value call even with our checks
+                pass
+            except Exception as e:
+                # Log other unexpected errors but don't crash
+                 print(f"Texture update error: {e}")
     
     def _start_preview(self, camera_ids: List[int]) -> None:
         """Start camera preview."""
@@ -650,57 +766,101 @@ class UnifiedVoxelVRApp:
     def update_2d_detections(self, detections: Dict[int, object]) -> None:
         """Update the latest 2D detections for visualization without re-inference."""
         self._latest_detections = detections
+        self._detection_timestamp = time.time()  # Track freshness
 
     def _preview_loop(self) -> None:
         """Camera preview update loop with ChArUco detection and 2D pose overlay."""
         from ..calibration.charuco import detect_charuco
         from ..pose.detector_2d import PoseDetector2D
         
-        # Lazy-load pose detector for 2D overlay (only used when NOT tracking externally)
+        # Lazy-load pose detector for 2D overlay
+        # Used when tracking is active but tracking thread isn't providing detections
         pose_detector = None
         self._latest_detections = {}
+        self._detection_timestamp = 0  # Track when we last received external detections
+        
+        # Performance tracking
+        frame_count = 0
+        fps_start_time = time.time()
+        timing_stats = {
+            'capture': [],
+            'charuco': [],
+            'pose_detect': [],
+            'skeleton_draw': [],
+            'texture_update': [],
+            'calib_process': [],
+            'loop_total': [],
+        }
         
         while self.preview_active and dpg.is_dearpygui_running():
+            loop_start = time.time()
+            
             if not self.camera_manager:
                 break
             
+            # Time: Frame capture
+            t0 = time.time()
             frames = self.camera_manager.get_all_latest_frames()
+            timing_stats['capture'].append(time.time() - t0)
             
             if frames:
                 detections = {}
                 is_tracking = self.view.state.tracking_mode in (TrackingMode.RUNNING, TrackingMode.STARTING)
                 
+                # Check if external detections are recent (within 0.5 seconds)
+                external_detections_fresh = (time.time() - self._detection_timestamp) < 0.5
+                
+                charuco_time = 0
+                pose_time = 0
+                draw_time = 0
+                texture_time = 0
+                
                 for cam_id, frame in frames.items():
                     display_frame = frame.image.copy()
                     
-                    # Always detect ChArUco for calibration
-                    result = detect_charuco(display_frame, self._charuco_board, self._aruco_dict)
-                    detections[cam_id] = {
-                        'success': result['success'],
-                        'corners': result['corners'],
-                        'ids': result['ids'],
-                        'frame': frame.image
-                    }
-                    
-                    # Use ChArUco annotated frame
-                    display_frame = result['image_with_markers']
+                    # Only run ChArUco detection when NOT tracking (calibration phase)
+                    # Skip during tracking to save CPU (~10-50ms per frame)
+                    if not is_tracking:
+                        t1 = time.time()
+                        result = detect_charuco(display_frame, self._charuco_board, self._aruco_dict)
+                        charuco_time += time.time() - t1
+                        
+                        detections[cam_id] = {
+                            'success': result['success'],
+                            'corners': result['corners'],
+                            'ids': result['ids'],
+                            'frame': frame.image
+                        }
+                        
+                        # Use ChArUco annotated frame
+                        display_frame = result['image_with_markers']
                     
                     # If tracking, draw 2D pose using available data
                     if is_tracking:
                         pose_result = None
                         
-                        # Case 1: Use externally provided detections (optimized)
-                        if cam_id in self._latest_detections:
+                        # Case 1: Use externally provided detections (from tracking thread)
+                        if external_detections_fresh and cam_id in self._latest_detections:
                             pose_result = self._latest_detections[cam_id]
+                        
+                        # Case 2: Run local inference (fallback when no tracking thread)
+                        else:
+                            # Initialize detector if needed (lazy load)
+                            if pose_detector is None:
+                                backend = "cpu" if self.force_cpu else "auto"
+                                log_info(f"Preview loop: Loading pose detector (backend={backend})...")
+                                pose_detector = PoseDetector2D(confidence_threshold=0.3, backend=backend)
+                                if not pose_detector.load_model():
+                                    log_error("Failed to load pose detector for preview overlay")
+                                    pose_detector = False  # Mark as failed to avoid retrying
                             
-                        # Case 2: Run local inference (fallback, e.g. standalone mode)
-                        # Only if we haven't received external updates recently?
-                        # For now, if we are in unified app mode with tracking thread running, 
-                        # we rely on update_2d_detections.
-                        elif pose_detector is None:
-                             # Wait for tracking thread to provide data to avoid double GPU usage
-                             pass
-                             
+                            # Run inference if detector is available
+                            t2 = time.time()
+                            if pose_detector and pose_detector is not False:
+                                pose_result = pose_detector.detect(frame.image, camera_id=cam_id)
+                            pose_time += time.time() - t2
+                        
+                        t3 = time.time()
                         if pose_result and hasattr(pose_result, 'positions'):
                             # Draw 2D skeleton on frame
                             display_frame = self._draw_2d_skeleton(display_frame, pose_result)
@@ -711,8 +871,12 @@ class UnifiedVoxelVRApp:
                         else:
                             # Show indicator even when no detection
                             self._draw_detection_indicator(display_frame, 0)
+                        draw_time += time.time() - t3
                     
+                    # Time: Texture update
+                    t4 = time.time()
                     self.update_camera_frame(cam_id, display_frame)
+                    texture_time += time.time() - t4
                     
                     # Update camera visibility in view state
                     self.view.update_camera_frame(
@@ -720,14 +884,48 @@ class UnifiedVoxelVRApp:
                         board_visible=result['success']
                     )
                 
-                # Process detections for calibration (when in calibration step)
+                timing_stats['charuco'].append(charuco_time)
+                timing_stats['pose_detect'].append(pose_time)
+                timing_stats['skeleton_draw'].append(draw_time)
+                timing_stats['texture_update'].append(texture_time)
+                
+                # Time: Calibration processing
+                t5 = time.time()
                 capture_result = self.calibration_panel.process_frame_detections(detections)
+                timing_stats['calib_process'].append(time.time() - t5)
                 
                 # Handle recording if enabled
                 if self._recording_enabled:
                     self._record_frames(frames)
             
-            time.sleep(0.033)  # ~30 FPS
+            # Track loop time
+            loop_time = time.time() - loop_start
+            timing_stats['loop_total'].append(loop_time)
+            frame_count += 1
+            
+            # Log timing stats every 60 frames (~2 seconds)
+            if frame_count % 60 == 0:
+                elapsed = time.time() - fps_start_time
+                fps = frame_count / elapsed if elapsed > 0 else 0
+                
+                # Calculate averages from last 60 samples
+                def avg_ms(data):
+                    recent = data[-60:] if len(data) >= 60 else data
+                    return (sum(recent) / len(recent) * 1000) if recent else 0
+                
+                log_info(f"[PERF] Preview FPS: {fps:.1f} | Loop: {avg_ms(timing_stats['loop_total']):.1f}ms")
+                log_debug(f"[PERF] Capture: {avg_ms(timing_stats['capture']):.1f}ms | "
+                         f"ChArUco: {avg_ms(timing_stats['charuco']):.1f}ms | "
+                         f"Pose: {avg_ms(timing_stats['pose_detect']):.1f}ms | "
+                         f"Draw: {avg_ms(timing_stats['skeleton_draw']):.1f}ms | "
+                         f"Texture: {avg_ms(timing_stats['texture_update']):.1f}ms | "
+                         f"Calib: {avg_ms(timing_stats['calib_process']):.1f}ms")
+                
+                # Reset counters
+                fps_start_time = time.time()
+                frame_count = 0
+            
+            time.sleep(0.033)  # ~30 FPS target
     
     def _draw_2d_skeleton(self, frame: np.ndarray, pose_result) -> np.ndarray:
         """Draw 2D skeleton overlay on frame."""
@@ -827,7 +1025,13 @@ class UnifiedVoxelVRApp:
         
         # Check for completion
         if progress['all_ready'] and not self.view.state.calibration.is_calibrated:
-            print("Calibration complete! Ready for tracking.")
+            calibration_log.info("Calibration complete! Ready for tracking.")
+            
+            # Load calibration into viewer immediately
+            if self.calibration_panel.state.extrinsics.result:
+                self.load_calibration(self.calibration_panel.state.extrinsics.result)
+                print(f"Loaded calibration into 3D viewer")
+            
             self._on_calibration_complete()
     
     def _update_pairwise_grid_ui(self) -> None:
@@ -883,21 +1087,26 @@ class UnifiedVoxelVRApp:
                 else:
                     dpg.set_value("connectivity_status", "○ Not Connected")
                 dpg.configure_item("connectivity_status", color=(200, 100, 100))
-        
-        # Update status text
-        if dpg.does_item_exist("calib_status"):
-            dpg.set_value("calib_status", self.view.get_calibration_status_text())
-    
+            
     def _on_calibration_complete(self) -> None:
         """Handle calibration completion - transition to tracking."""
-        result = self.calibration_panel.state.extrinsics.result
-        if result:
-            # Save calibration
-            from ..config import CONFIG_DIR
-            output_path = CONFIG_DIR / "calibration" / "calibration.json"
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            result.save(output_path)
-            print(f"Saved calibration to {output_path}")
+        # Get final calibration from state
+        calibration = self.calibration_panel.state.extrinsics.result
+        
+        if calibration:
+            # Update skeleton viewer with camera positions
+            self.load_calibration(calibration)
+            print(f"Loaded calibration into 3D viewer")
+            
+            # Auto-save?
+            # calibration.save("calibration.json")
+            
+        # Update status text
+        dpg.set_value("calib_status", "Calibrated")
+        dpg.configure_item("calib_status", color=(100, 200, 100))
+        
+        # Enable tracking button
+        dpg.configure_item("tracking_btn", enabled=True, label="▶ Start Tracking")
     
     def _create_pairwise_grid(self, camera_ids: List[int]) -> None:
         """Create or update the pairwise progress grid."""
@@ -987,7 +1196,7 @@ class UnifiedVoxelVRApp:
             self.view.state.tracking_mode = TrackingMode.STOPPED
             self.view._notify_state_change()
             dpg.set_item_label("tracking_btn", "▶ Start Tracking")
-            print("Tracking stopped")
+            log_info("Tracking stopped")
             if self._on_stop_tracking:
                 self._on_stop_tracking()
         else:
@@ -998,9 +1207,9 @@ class UnifiedVoxelVRApp:
             
             # Show warning if not calibrated
             if not self.view.state.calibration.is_calibrated:
-                print("⚠ WARNING: Tracking started without calibration - skeleton overlay visible for debugging")
+                log_warn("Tracking started without calibration - skeleton overlay visible for debugging")
             else:
-                print("Tracking started")
+                log_info("Tracking started")
             
             if self._on_start_tracking:
                 self._on_start_tracking()
@@ -1020,6 +1229,48 @@ class UnifiedVoxelVRApp:
         self.view.set_apriltags_enabled(app_data)
         dpg.configure_item("apriltag_export_group", show=app_data)
     
+    def _on_postcalib_click(self, sender=None, app_data=None) -> None:
+        """Handle post-calibration button click."""
+        from ..transport.post_calibration import PostCalibrationState
+        
+        if self.post_calibrator.state == PostCalibrationState.IDLE:
+            # Start calibration
+            self.post_calibrator.start()
+            dpg.set_item_label("postcalib_btn", "⏳ Calibrating...")
+        elif self.post_calibrator.state == PostCalibrationState.COMPLETE:
+            # Reset and start again
+            self.post_calibrator.reset()
+            self.post_calibrator.start()
+            dpg.set_item_label("postcalib_btn", "⏳ Calibrating...")
+    
+    def _adjust_yaw(self, delta: float) -> None:
+        """Adjust yaw offset by delta degrees."""
+        self.post_calibrator.adjust_yaw(delta)
+        self._update_yaw_label()
+    
+    def _reset_yaw(self) -> None:
+        """Reset yaw offset to zero."""
+        self.post_calibrator.reset_yaw()
+        self._update_yaw_label()
+    
+    def _update_yaw_label(self) -> None:
+        """Update yaw offset label in UI."""
+        yaw = self.post_calibrator.yaw_offset
+        dpg.set_value("yaw_offset_label", f"{yaw:.0f}°")
+    
+    def _update_postcalib_status(self) -> None:
+        """Update post-calibration status display. Call from main loop."""
+        from ..transport.post_calibration import PostCalibrationState
+        
+        status_text = self.post_calibrator.get_status_text()
+        dpg.set_value("postcalib_status", status_text)
+        
+        # Update button label when complete
+        if self.post_calibrator.state == PostCalibrationState.COMPLETE:
+            dpg.set_item_label("postcalib_btn", "✓ Re-Calibrate")
+        elif self.post_calibrator.state == PostCalibrationState.IDLE:
+            dpg.set_item_label("postcalib_btn", "🎯 Calibrate Origin")
+
     def _on_export_apriltag_click(self, sender, app_data) -> None:
         """Handle export AprilTag sheet."""
         from ..config import CONFIG_DIR
@@ -1225,11 +1476,11 @@ class UnifiedVoxelVRApp:
         
         def on_tracking_started(self) -> None:
             """Handle tracking started."""
-            print("Tracking started successfully")
+            log_info("Tracking started successfully")
         
         def on_tracking_stopped(self) -> None:
             """Handle tracking stopped."""
-            print("Tracking stopped")
+            log_info("Tracking stopped")
         
         def get_osc_config(self) -> tuple:
             """Get OSC IP and port from the unified app's inputs."""
@@ -1300,10 +1551,10 @@ class UnifiedVoxelVRApp:
     class _OscStatusShim:
         """Minimal shim for OSC status display."""
         def on_connect(self) -> None:
-            print("OSC connected")
+            osc_log.info("OSC connected")
         
         def on_disconnect(self) -> None:
-            print("OSC disconnected")
+            osc_log.info("OSC disconnected")
         
         def on_message_sent(self) -> None:
             pass  # Called frequently, don't log
@@ -1371,7 +1622,7 @@ class UnifiedVoxelVRApp:
         from ..transport.osc_sender import pose_to_trackers_with_rotations
         from ..transport.coordinate import create_default_transform, transform_pose_to_vrchat, CoordinateTransform
         
-        print("Starting idle OSC loop...")
+        osc_log.info("Starting idle OSC loop...")
         # T-Pose is already in Y-Up (VRChat-like) coordinates, so we don't need to flip Y.
         # Use identity rotation.
         coord_transform = CoordinateTransform(rotation=np.eye(3))
@@ -1403,11 +1654,19 @@ class UnifiedVoxelVRApp:
                             # 1. Update local skeleton view
                             self.update_skeleton_view(positions, valid)
                             
-                            # 2. Transform coordinates for VRChat
+                            # 2. Get active transform (post-calibrator if available)
+                            postcalib_transform = self.post_calibrator.get_transform()
+                            if postcalib_transform is not None:
+                                active_transform = postcalib_transform
+                            else:
+                                active_transform = coord_transform
+                            
+                            # 3. Transform coordinates for VRChat
                             transformed, _ = transform_pose_to_vrchat(
                                 positions,
-                                coord_transform,
+                                active_transform,
                             )
+
                             
                             # 3. Convert to VRChat trackers
                             trackers = pose_to_trackers_with_rotations(
@@ -1453,7 +1712,7 @@ class UnifiedVoxelVRApp:
             self._create_pairwise_grid(cameras)
             # Start calibration capture phase (just sets step, doesn't compute yet)
             self.calibration_panel.begin_calibration()
-            print(f"Auto-detected {len(cameras)} camera(s), ready for calibration")
+            camera_log.info(f"Auto-detected {len(cameras)} camera(s), ready for calibration")
         
         while dpg.is_dearpygui_running():
             dpg.render_dearpygui_frame()
@@ -1464,8 +1723,18 @@ class UnifiedVoxelVRApp:
     
     def request_stop(self) -> None:
         """Request application shutdown."""
+        # Signal tracking thread to stop via shared state
+        if hasattr(self, 'view') and hasattr(self.view, 'state'):
+            self.view.state.tracking_mode = TrackingMode.STOPPED
+
         self._cleanup_recording()
         self._stop_event.set()
+        
         if self.osc_sender:
             self.osc_sender.disconnect()
+            
+        # Give tracking thread a moment to exit loop and release resources
+        import time
+        time.sleep(0.5)
+            
         dpg.stop_dearpygui()

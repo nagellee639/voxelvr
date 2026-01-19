@@ -33,7 +33,7 @@ class CameraConfig(BaseModel):
 class CalibrationConfig(BaseModel):
     """Calibration settings."""
     # ChArUco board parameters
-    charuco_squares_x: int = 7
+    charuco_squares_x: int = 5
     charuco_squares_y: int = 5
     charuco_square_length: float = 0.04  # meters
     charuco_marker_length: float = 0.03  # meters

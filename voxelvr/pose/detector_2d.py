@@ -232,12 +232,28 @@ class PoseDetector2D:
         # Preprocess: resize and normalize
         input_tensor = self._preprocess(image)
         
-        # Run inference
+        # Run inference with GPU-to-CPU fallback
         try:
             outputs = self.session.run(None, {self.input_name: input_tensor})
         except Exception as e:
-            print(f"Inference failed: {e}")
-            return None
+            # Check if we should try CPU fallback
+            if self.backend != "cpu" and not getattr(self, '_cpu_fallback_attempted', False):
+                print(f"GPU inference failed: {e}")
+                print("Falling back to CPU-only mode...")
+                self._cpu_fallback_attempted = True
+                self.backend = "cpu"
+                self.session = None  # Force reload
+                if self.load_model(self.model_path):
+                    try:
+                        outputs = self.session.run(None, {self.input_name: input_tensor})
+                    except Exception as e2:
+                        print(f"CPU inference also failed: {e2}")
+                        return None
+                else:
+                    return None
+            else:
+                print(f"Inference failed: {e}")
+                return None
         
         # Parse output
         keypoints = self._postprocess(outputs, orig_width, orig_height)

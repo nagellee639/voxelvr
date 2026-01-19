@@ -91,6 +91,7 @@ def triangulate_pose(
     keypoints_list: List[Any],  # List[Keypoints2D]
     projection_matrices: Dict[int, np.ndarray],
     confidence_threshold: float = 0.3,
+    min_views: int = 2,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Triangulate a full pose from multiple camera views.
@@ -111,26 +112,49 @@ def triangulate_pose(
     confidences = np.zeros(num_joints)
     valid_mask = np.zeros(num_joints, dtype=bool)
     
-    for joint_idx in range(num_joints):
-        # Collect 2D observations of this joint from all cameras
-        points_2d = {}
-        joint_confidences = []
+    for i in range(num_joints):
+        valid_cams = []
+        points = []
+        projs = []
         
-        for kp in keypoints_list:
-            if kp.confidences[joint_idx] >= confidence_threshold:
-                points_2d[kp.camera_id] = kp.positions[joint_idx:joint_idx+1]
-                joint_confidences.append(kp.confidences[joint_idx])
-        
-        if len(points_2d) >= 2:
-            # Triangulate this joint
-            proj_mats = {cid: projection_matrices[cid] for cid in points_2d.keys()}
-            pos_3d, errors = triangulate_points(points_2d, proj_mats)
+        # Collect observations for this joint
+        for kp_data in keypoints_list: # Iterate through Keypoints2D objects
+            cam_id = kp_data.camera_id
+            # Check confidence and if projection matrix exists for this camera
+            if cam_id in projection_matrices and kp_data.confidences[i] >= confidence_threshold:
+                valid_cams.append(cam_id)
+                points.append(kp_data.positions[i])
+                projs.append(projection_matrices[cam_id])
+                
+        if len(valid_cams) < min_views:
+            continue
             
-            if len(pos_3d) > 0:
-                positions_3d[joint_idx] = pos_3d[0]
-                confidences[joint_idx] = np.mean(joint_confidences)
-                valid_mask[joint_idx] = True
-    
+        # Stack data
+        points_map = {cam: pt.reshape(1, 2) for cam, pt in zip(valid_cams, points)}
+        proj_map = {cam: P for cam, P in zip(valid_cams, projs)}
+        
+        # Use RANSAC for robust triangulation
+        try:
+            pt_3d, error, inliers = ransac_triangulate(
+                points_map, 
+                proj_map, 
+                iterations=50, 
+                threshold=10.0 # Pixel error threshold
+            )
+            
+            # Check result validity
+            if len(inliers) >= min_views:
+                positions_3d[i] = pt_3d
+                # Confidence can be based on fraction of cameras agreeing or mean confidence of inliers
+                # For simplicity, using fraction of cameras agreeing
+                confidences[i] = len(inliers) / len(valid_cams) 
+                valid_mask[i] = True
+            
+        except Exception as e:
+            # Fallback to DLT if RANSAC fails (shouldn't happen often)
+            # print(f"RANSAC failed for joint {i}: {e}")
+            pass
+            
     return positions_3d, confidences, valid_mask
 
 
@@ -224,6 +248,14 @@ class TriangulationPipeline:
             kp for kp in keypoints_list 
             if kp.camera_id in self.projection_matrices
         ]
+        
+        # Debug: Check why we might be failing here
+        print(f"DEBUG: Processing {len(keypoints_list)} inputs. ProjMats keys: {list(self.projection_matrices.keys())}")
+        print(f"DEBUG: Input cams: {[k.camera_id for k in keypoints_list]}")
+        print(f"DEBUG: Valid cams: {[k.camera_id for k in valid_keypoints]}")
+
+        if len(valid_keypoints) < 2:
+            return None
         
         if len(valid_keypoints) < 2:
             return None

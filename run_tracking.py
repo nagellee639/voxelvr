@@ -123,6 +123,7 @@ def main():
     extrinsics_list = []
     
     for cam_id, data in calibration.cameras.items():
+        print(f"DEBUG: Loading calibration for cam {cam_id}. Keys: {list(data.keys())}")
         if cam_id in camera_ids:
             intrinsics_list.append(CameraIntrinsics(**data['intrinsics']))
             extrinsics_list.append(CameraExtrinsics(**data['extrinsics']))
